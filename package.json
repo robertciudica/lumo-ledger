@@ -1,0 +1,36 @@
+{
+  "name": "lumo-ledger",
+  "version": "1.0.0",
+  "description": "Append-only, event-sourced, multi-tenant accounting core extracted from a production SaaS.",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "ledger",
+    "accounting",
+    "double-entry",
+    "idempotency",
+    "multi-tenant",
+    "event-sourcing"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^22.10.0",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.6",
+    "typescript": "^5.7.2"
+  }
+}
