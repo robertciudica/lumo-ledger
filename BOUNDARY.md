@@ -85,15 +85,15 @@ storage input types (`CreateInvoiceInput` and friends) that an implementer of
 
 ## Out of scope, deliberately
 
-These exist in Lumo and are not here. Each one is a place where the ledger stops
-and the product starts.
+These exist in Lumo and are not here. Each one is a place where the ledger
+stops and the product starts.
 
-| Lumo entry point | Why it is not here |
+| What | Why it is not here |
 | --- | --- |
-| `BillingService.generateInvoice` | Prices a charge from an enrollment in a class with a pricing type. All product, no ledger. |
-| `core/billing/enrollment-invoice.ts` | Decides whether signing someone up should bill them. |
-| `core/billing/reprice.ts` | Rewrites open charges after a price change. Depends on the pricing model. |
-| `core/billing/invoice-period.ts` | Derives billing periods and due dates from a calendar the product owns. |
-| `core/billing/price-drift.ts` | Compares a charge against the current price list. |
+| Generating a charge from an enrolment | Prices a charge from a class and a pricing type. All product, no ledger. |
+| Deciding whether signing up bills someone | Product rule. |
+| Repricing open charges after a price change | Depends on the pricing model. |
+| Deriving billing periods and due dates | From a calendar the product owns. |
+| Comparing a charge against the current price list | Product rule. |
 | The monthly summary projector | A read model over the ledger, built from the event log. It belongs to whoever is reading. |
 | Anything that reads the event log | The ledger writes events. Replaying them is the caller's job. |

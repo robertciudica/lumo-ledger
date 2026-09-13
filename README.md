@@ -7,8 +7,9 @@
 The accounting core of [Lumo](https://lumo.dance), a multi-tenant SaaS for
 dance studios, extracted as a standalone package. It runs in production behind
 paying customers, recording what people owe, what they paid, and what money
-moved. This is that logic with the studio-specific names replaced by generic
-ones, not a demo.
+moved. The 1.0 release is that logic with the studio-specific names replaced by
+generic ones. 1.1 adds the account lock described under Concurrency, found by
+reviewing the extraction and now being ported back. Not a demo.
 
 There are two ledgers and one event log. `BillingService` is the receivables
 side: charges, payments, allocations, standing credit, reversal. `LedgerService`
@@ -227,6 +228,28 @@ tell the difference and neither should your error handling.
 
 The in-memory store cannot demonstrate any of this. It is single-threaded and
 its `runTransaction` does not roll back, which its doc comment says out loud.
+
+## Cost per operation
+
+`npm run bench` counts the queries each operation issues, against Postgres in
+WebAssembly on one thread. The first column is the one to read: it is a
+property of the code and does not depend on the machine.
+
+| Operation | Queries | Grows with |
+| --- | ---: | --- |
+| `recordPayment`, small payment, 1 to 100 open charges | 9 | nothing |
+| `recordPayment`, covering N charges | 8 + 2N | one insert and one status update per charge it settles |
+| `previewAllocation`, 1 to 100 open charges | 2 | nothing |
+| `calculateBalance` | 3 | nothing |
+
+The waterfall loads an account's charges and its allocations in two queries
+and plans in memory, so an account with a hundred open charges costs the same
+to pay as one with a single charge. It used to be one query per charge. The
+second row grows because writing an allocation per settled charge is the work
+the operation exists to do.
+
+The throughput column that script also prints is a floor from a single-threaded
+WebAssembly build, kept to catch regressions rather than to quote.
 
 ## Design decisions
 

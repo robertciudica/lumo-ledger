@@ -26,7 +26,7 @@ wrote a package. It is *why* one night was enough, which section 5 gets to.
 **Extractable, and extracted.** The ledger came out whole. Nothing was stubbed,
 no behaviour was lost, and no secret or customer datum came with it.
 
-The reason it went smoothly is the finding worth keeping. Lumo's `src/core` was
+The reason it went smoothly is the finding worth keeping. Lumo's core was
 built under a rule the codebase calls the golden rule: no ORM imports, no HTTP,
 no file I/O, all storage through one injected port, and the tenant id passed
 explicitly on every call. That rule turned a rewrite into a rename job. A layer
@@ -35,93 +35,49 @@ would have been to leave it where it was.
 
 ---
 
-## 1. What the ledger is
+## 1. What the ledger is, and what it touches
 
-Lumo keeps two money ledgers that share one event log. Both live in `src/core/`,
-which is a framework-free layer: no Prisma, no Next.js, no HTTP, no file I/O.
-Every database call goes through a single port interface injected into the
-constructor, and every method takes `organizationId` as an explicit argument.
+Lumo keeps two money ledgers that share one event log, both in a
+framework-free core: no ORM, no HTTP, no file I/O. Every database call goes
+through one port interface injected into the constructor, and every method
+takes `organizationId` as an explicit argument.
 
-### The receivables ledger (what is owed, what was paid, what covers what)
+The receivables side records charges, payments, which payment covers which
+charge, standing credit, and reversal. The cash side records money in, money
+out, and recurring expenses. They touch in one place: a payment writes its own
+cash row, in the same transaction.
 
-| File | Lines | What it holds |
-| --- | ---: | --- |
-| `src/core/billing/BillingService.ts` | 1567 | `recordPayment`, `recordPaymentForInvoice`, `previewAllocation`, `applyCredit`, `calculateBalance`, `voidInvoicePayments`, `applyCreditNote`, `createManualInvoice` are the ledger. `generateInvoice` is not (see section 2). |
-| `src/core/billing/invoice-status.ts` | 80 | `sumAllocations`, `computeBalance`, `computeEffectiveStatus`. Pure. The single definition of what an invoice is worth and what state it is in. |
+The survey classified everything the two services reach into four kinds:
 
-### The cash ledger (money that moved, in and out)
-
-| File | Lines | What it holds |
-| --- | ---: | --- |
-| `src/core/ledger/LedgerService.ts` | 482 | `addEntry`, `voidEntry`, `createTemplate`, `updateTemplate`, `deleteTemplate`, `materializeTemplatesForMonth`, plus the pure `computeLedgerTotals`, `categoryMatchesDirection`, `monthKey`. |
-
-### Shared spine
-
-| File | Lines | What it holds |
-| --- | ---: | --- |
-| `src/ports/IDatabase.ts` | 1147 | The storage port and every entity type. About 190 lines of it are ledger entities and ledger methods; the rest is attendance, scheduling, memberships, classes. |
-| `src/core/errors.ts` | 77 | `DomainError` and five subclasses. Used unchanged. |
-| `src/core/constants.ts` | 207 | `EVENT_TYPES` (the event-log vocabulary) and `SYSTEM_ACTOR_ID`. Six event types belong to the ledger. |
-| `src/core/policies.ts` | 362 | Role to permission matrix plus `requirePermission`. Four permissions are checked inside the ledger. |
-| `src/core/types.ts` | 184 | The `Money` type (integer minor units) and `RecordPaymentResult`. |
-
-### Tests
-
-| File | `it()` blocks | Covers |
-| --- | ---: | --- |
-| `src/core/billing/BillingService.test.ts` | 60 | `recordPayment` (34), `recordPaymentForInvoice` (17), `previewAllocation` (9). Six of the 60 assert membership-cycle behaviour, which is domain. |
-| `src/core/billing/BillingService.applyCredit.test.ts` | 16 | Standing credit applied to open invoices. |
-| `src/core/billing/BillingService.voidInvoicePayments.test.ts` | 12 | Reversal. |
-| `src/core/billing/BillingService.createManualInvoice.test.ts` | 14 | Ad-hoc charge creation. |
-| `src/core/ledger/LedgerService.test.ts` | 29 | Cash ledger, recurring templates, and the payment-to-cash-ledger auto-sync. |
-| `src/tests/helpers/MockDatabase.ts` | n/a | 1196-line in-memory implementation of the storage port. Roughly 350 lines are ledger tables. |
-| `src/tests/helpers/factories.ts` | n/a | 394 lines of fixture builders, about 80 of them ledger-relevant. |
-
-`invoice-status.ts` has no direct unit test. It is covered indirectly by
-`src/tests/actions/invoice-status.characterization.test.ts`, which drives it
-through two Next.js server actions with Prisma mocked, so that file cannot move.
-
-Total: 131 `it()` blocks over the ledger surface, plus 12 indirect ones.
-
----
-
-## 2. What it is tangled with
-
-Walking outward from the two services:
-
-| Dependency | Class | Verdict |
+| Kind | What it was | Verdict |
 | --- | --- | --- |
-| `../../ports/IDatabase` | persistence port (interface only) | Extract the ledger slice of it. No Prisma types leak into it, so this is a type-level cut, not a rewrite. |
-| `../errors` | utility | Extract whole. Zero dependencies of its own. |
-| `../constants` (`EVENT_TYPES`, `SYSTEM_ACTOR_ID`) | utility | Extract the six ledger event types and the system actor id. The other 30 event types are attendance, scheduling, enrollment. |
-| `../policies` (`requirePermission`, `UserRole`) | domain-adjacent | Extract the guard, drop the matrix. See section 3 of DECISIONS.md. |
-| `../types` (`Money`) | utility | Extract. It is a type alias plus a doc comment that is the reason the system has no floating-point money. |
-| `./invoice-period` (`dueDateForMonth`) | domain | Not needed. Only `generateInvoice` calls it, and `generateInvoice` is out of scope. |
-| `@prisma/client` | persistence | Never imported by `src/core`. Nothing to cut. |
-| NestJS / any framework | framework | Not present. Lumo is Next.js, and `src/core` imports none of it. |
-| Third-party runtime packages | third party | None. The two services import nothing outside `src/`. |
+| The storage port | An interface, with no driver types leaking into it | Take the ledger slice of it. A type-level cut, not a rewrite. |
+| Utilities | Errors, the money type, event names, the permission guard | Take whole. Zero dependencies of their own. |
+| Domain | Pricing, billing periods, enrolment rules, a fixed role matrix | Leave. The ledger takes an amount and does not ask where it came from. |
+| Framework, ORM, third-party | Nothing | Not imported by the core at all. |
 
-The only true coupling is the storage port, and it is already an interface.
+The only real coupling was the storage port, and it was already an interface.
+What had to change was naming, not structure: the party that owes money was a
+student and became an account, the expense categories were a dance studio's
+chart of accounts and became an argument, and authorization arrived as a role
+from a fixed matrix and became a permission set the caller supplies. About 135
+identifier references in the two services, nearly all a single rename.
 
-### Domain concepts the ledger references
+## 2. What was left behind
 
-These are the renames the extraction has to make. Counted across the files
-being taken:
+Everything that decides an amount: generating a charge from an enrolment,
+repricing open charges after a price change, deriving billing periods from a
+calendar, comparing a charge against the current price list. Each of those
+reads the product's pricing model. The ledger is the thing they hand the
+amount to.
 
-| Lumo concept | Occurrences | Generic replacement |
-| --- | ---: | --- |
-| `studentId` (the party who owes money) | 50 | `accountId` |
-| `actorRole` / `UserRole` | 37 | an explicit permission set |
-| `classId`, `studentMembershipId`, `sessionId`, `cycleStart`, `cycleEnd` | 21 | dropped, replaced by one optional `reference` string |
-| `staffUserId` (who a payroll expense is for) | 11 | `counterpartyId` |
-| `payerUserId` (the human who handed over the money) | 10 | `payerId` |
-| `findStudentById` / `Student` entity | 3 | `findAccountById` / `Account` (`{ id, organizationId }`) |
-| `"Dancer"` in `NotFoundError` messages | 3 | `"Account"` |
-| Ledger categories (`TUITION`, `PRIVATE_LESSON`, `HALL_RENTAL`, `COMPETITIONS`, `CAMP`) | 5 enum members | the taxonomy becomes caller-supplied |
-| Membership cycle advance | 4 comment blocks, 0 live statements | deleted (v4 already removed the behaviour, only the comments remain) |
+Also left: the read models. Lumo builds monthly summaries by replaying the
+event log. That is a consumer of the ledger, not part of it.
 
-About 135 references in the two service files, nearly all of them a single
-identifier rename. The same names recur in the storage port and in the tests.
+One genuine loss: a charge carried five foreign keys into product tables
+(class, membership, session, cycle start and end). Nothing in the extracted
+logic read them, so they were dropped and one optional `reference` string
+stands in.
 
 ---
 
@@ -238,8 +194,8 @@ each other in exactly one place (a payment writes its own cash row), and that
 seam is one of the more interesting things in the package. Splitting them would
 have hidden it.
 
-Everything that prices a charge is out: `generateInvoice`, `enrollment-invoice`,
-`reprice`, `invoice-period`, `price-drift`. Those read a product's pricing model.
+Everything that prices a charge is out: generating a charge from an enrolment,
+repricing, billing periods, price drift. Those read a product's pricing model.
 The ledger takes an amount and does not ask where it came from.
 
 ### 5.2. Class names kept, directories renamed
@@ -307,11 +263,11 @@ quiet one in a monthly report.
 worth saying out loud that `Invoice` here means "a charge somebody owes" and
 carries no document, no numbering, no tax handling.
 
-### 5.6. `IDatabase` narrowed to `LedgerStore`
+### 5.6. The storage port narrowed to `LedgerStore`
 
-Lumo's storage port is 1147 lines covering attendance, scheduling, memberships
-and classes. Only the ledger slice came across, renamed to `LedgerStore`: 29
-methods, every one taking `organizationId`.
+Lumo's storage port covers the whole product: attendance, scheduling,
+memberships, classes. Only the ledger slice came across, renamed to
+`LedgerStore`: 29 methods, every one taking `organizationId`.
 
 Two contract notes that were comments in Lumo are now part of the interface
 documentation, because an implementer who misses them gets a silent bug rather
@@ -328,8 +284,8 @@ if a store does not do it, every idempotency test in the suite is theatre.
 
 ### 5.7. In-memory store ships in `src`, not in `test`
 
-Lumo's `MockDatabase` lives under `src/tests/helpers`. Here the equivalent is
-`src/testing/InMemoryLedgerStore.ts`, and it is exported rather than kept in
+Lumo's in-memory test double lives with its test helpers. Here the equivalent
+is `src/testing/InMemoryLedgerStore.ts`, and it is exported rather than kept in
 the test folder. Two reasons: the brief asked for a shipped in-memory
 implementation, and anyone writing their own store needs a reference more than
 they need a test fixture. In 1.1.0 it moved to its own entry point,
@@ -370,7 +326,7 @@ not mistaken for an oversight.
   seed the generic equivalent or nothing.
 - Written new, all marked `// added during extraction, not from Lumo`: the
   `invoice-status` suite (Lumo covers it only through a test that drives two
-  Next.js server actions with the ORM mocked, which cannot travel), the
+  server actions with the ORM mocked, which cannot travel), the
   invariants suite, the README example, and a handful of tenant-isolation cases.
 
 The parity test between `previewAllocation` and `recordPayment` came across
