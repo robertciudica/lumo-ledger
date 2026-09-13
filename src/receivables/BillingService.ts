@@ -29,12 +29,22 @@ import {
   ValidationError,
   IdempotencyError,
   ForbiddenError,
+  UniqueViolationError,
+  EVENT_LOG_KEY_CONSTRAINT,
 } from '../errors'
 import { EVENT_TYPES } from '../events'
 import type { Permission } from '../permissions'
 import { requirePermission } from '../permissions'
 import type { Money } from '../money'
 import { monthKey } from '../cash/LedgerService'
+import {
+  planWaterfall,
+  selectOpenInvoices,
+  sumAllocationsByInvoice,
+} from './waterfall'
+import type { AllocationStep, OpenCharge } from './waterfall'
+
+export type { AllocationStep, OpenCharge } from './waterfall'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -47,6 +57,13 @@ export interface BillingConfig {
    * built with, otherwise the two ledgers will disagree about direction.
    */
   readonly paymentCategory: LedgerCategory
+
+  /**
+   * Source of "now". Defaults to `() => new Date()`. Injected rather than
+   * called directly so a caller can freeze time in a test, or hand the ledger
+   * a clock that is not the process clock.
+   */
+  readonly clock?: () => Date
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -108,17 +125,6 @@ export interface PreviewAllocationParams {
   accountId: string
   amount: Money
   organizationId: string
-}
-
-export interface AllocationStep {
-  invoiceId: string
-  month: string | null
-  /** Outstanding balance before this step's allocation. */
-  outstanding: Money
-  /** Amount to allocate in this step. */
-  toAllocate: Money
-  /** Predicted status after this step. */
-  newStatus: InvoiceStatus
 }
 
 export interface PreviewAllocationResult {
@@ -222,10 +228,59 @@ export interface CreateManualInvoiceParams {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export class BillingService {
+  private readonly clock: () => Date
+
   constructor(
     private readonly db: LedgerStore,
     private readonly config: BillingConfig
-  ) {}
+  ) {
+    this.clock = config.clock ?? (() => new Date())
+  }
+
+  /**
+   * Loads the account's open charges and what has already landed on each, as
+   * the waterfall planner wants them. One query for the charges and one for
+   * every allocation on the account, grouped in memory: no query per charge.
+   */
+  private async loadOpenCharges(
+    db: LedgerStore,
+    accountId: string,
+    organizationId: string
+  ): Promise<OpenCharge[]> {
+    const [invoices, allocations] = await Promise.all([
+      db.findInvoicesByAccount(accountId, organizationId),
+      db.findAllocationsByAccount(accountId, organizationId),
+    ])
+    const allocated = sumAllocationsByInvoice(allocations)
+    return selectOpenInvoices(invoices).map(invoice => ({
+      invoice,
+      priorAllocated: allocated.get(invoice.id) ?? 0,
+    }))
+  }
+
+  /**
+   * Runs the body of a mutating operation and translates a lost idempotency
+   * race into the same error a repeated call gets.
+   *
+   * The pre-flight read of the event log can lose to a concurrent caller. The
+   * store's unique constraint on (organizationId, idempotencyKey) cannot, and
+   * it fires on the event-log write inside the transaction, rolling the whole
+   * thing back. From the caller's side that is indistinguishable from having
+   * submitted the key twice, so it is reported the same way.
+   */
+  private async anchored<T>(idempotencyKey: string, run: () => Promise<T>): Promise<T> {
+    try {
+      return await run()
+    } catch (error) {
+      if (
+        error instanceof UniqueViolationError &&
+        error.constraint === EVENT_LOG_KEY_CONSTRAINT
+      ) {
+        throw new IdempotencyError(idempotencyKey)
+      }
+      throw error
+    }
+  }
 
   // ───────────────────────────────────────────────────────────────────────────
   // recordPayment
@@ -299,6 +354,8 @@ export class BillingService {
     }
 
     // ── Load account (outside transaction, read-only check) ─────────────────
+    // The fast fail. The authoritative check is the lock inside the
+    // transaction, which is the only one that cannot be raced.
     const account = await this.db.findAccountById(
       params.accountId,
       params.organizationId
@@ -308,9 +365,20 @@ export class BillingService {
     }
 
     // ── Atomic transaction: payment, allocations, event log, cash row ────────
-    return this.db.runTransaction(async (tx: LedgerStore): Promise<RecordPaymentResult> => {
+    return this.anchored(params.idempotencyKey, () =>
+      this.db.runTransaction(async (tx: LedgerStore): Promise<RecordPaymentResult> => {
+      // ── Step 0: Lock the account ──────────────────────────────────────────
+      // Everything below reads outstanding balances and then spends them.
+      // Without this lock two concurrent payments both see the same charge as
+      // open and both allocate to it, and the charge ends up overpaid. The
+      // lock is held until this transaction commits.
+      const locked = await tx.lockAccount(params.accountId, params.organizationId)
+      if (!locked) {
+        throw new NotFoundError('Account', params.accountId)
+      }
+
       // ── Step 1: Create the payment record ─────────────────────────────────
-      const now = new Date()
+      const now = this.clock()
       const transaction = await tx.createTransaction(
         {
           amount:         params.amount,
@@ -326,89 +394,39 @@ export class BillingService {
         params.organizationId
       )
 
-      // ── Step 2: Load open charges for waterfall allocation ────────────────
-      // Filter to PENDING, PARTIALLY_PAID or OVERDUE, sort oldest first.
-      // "Oldest first" means allocating to the most overdue debt before newer
-      // debt: the standard accounting waterfall.
-      const allInvoices = await tx.findInvoicesByAccount(
-        params.accountId,
-        params.organizationId
-      )
-      const openInvoices = allInvoices
-        .filter(inv =>
-          inv.status === 'PENDING' ||
-          inv.status === 'PARTIALLY_PAID' ||
-          // OVERDUE charges are still owed and must be included in the
-          // waterfall. Excluding them would record the payment as credit while
-          // leaving the overdue charge outstanding, which is a reconciliation
-          // bug that only shows up at month end.
-          inv.status === 'OVERDUE'
-        )
-        // Ascending by createdAt: oldest unpaid charge first.
-        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      // ── Step 2: Load open charges and what has already landed on each ─────
+      const open = await this.loadOpenCharges(tx, params.accountId, params.organizationId)
 
-      // ── Step 3: Waterfall allocation ─────────────────────────────────────
-      // `remaining` tracks how much of the payment is still unallocated.
-      // `allocated` accumulates the total matched to charges.
-      // Integers throughout: no floating-point arithmetic.
-      //
-      // `invoiceStatusUpdates` collects charges that need a status change
-      // after allocation (step 4, the projection update).
-      let remaining: Money = params.amount
-      let allocated: Money = 0
-      const invoiceStatusUpdates: Array<{ id: string; newStatus: InvoiceStatus }> = []
+      // ── Step 3: Plan the waterfall ────────────────────────────────────────
+      // The plan is a pure function of the charges and the amount, and it is
+      // the same function `previewAllocation` shows the operator. See
+      // `waterfall.ts` for the algorithm and the worked example.
+      const plan = planWaterfall(open, params.amount)
+      const allocated = plan.allocated
+      const remaining = plan.credit
 
-      for (const invoice of openInvoices) {
-        // Short-circuit: nothing left to allocate
-        if (remaining <= 0) break
-
-        // Compute true outstanding by summing prior allocations. This is what
-        // prevents double-allocation on a partially paid charge.
-        const priorAllocations = await tx.findAllocationsByInvoice(
-          invoice.id,
-          params.organizationId
-        )
-        const priorAllocated: Money = priorAllocations.reduce(
-          (sum, a) => sum + a.amount,
-          0
-        )
-        const outstanding: Money = invoice.amount - priorAllocated
-
-        // Skip fully-paid charges that still carry a stale status
-        if (outstanding <= 0) continue
-
-        const toAllocate: Money = Math.min(remaining, outstanding)
-
+      // ── Step 4: Commit the plan ───────────────────────────────────────────
+      // One allocation row per step, then the status projection. The
+      // allocations stay the truth; the status column is a cache of them.
+      const statusByInvoice = new Map(open.map(o => [o.invoice.id, o.invoice.status]))
+      for (const step of plan.steps) {
         await tx.createAllocation(
           {
-            amount:        toAllocate,
+            amount:        step.toAllocate,
             createdBy:     params.actorId,
             transactionId: transaction.id,
-            invoiceId:     invoice.id,
+            invoiceId:     step.invoiceId,
           },
           params.organizationId
         )
 
-        remaining -= toAllocate
-        allocated += toAllocate
-
-        // Track the new total allocated for this charge to determine status
-        const newTotalAllocated = priorAllocated + toAllocate
-        const newStatus: InvoiceStatus =
-          newTotalAllocated >= invoice.amount ? 'PAID' : 'PARTIALLY_PAID'
-
-        // Only update if the status actually changes
-        if (newStatus !== invoice.status) {
-          invoiceStatusUpdates.push({ id: invoice.id, newStatus })
+        if (step.newStatus !== statusByInvoice.get(step.invoiceId)) {
+          await tx.updateInvoice(
+            step.invoiceId,
+            { status: step.newStatus },
+            params.organizationId
+          )
         }
-      }
-
-      // ── Step 4: Update the status projection ──────────────────────────────
-      // After creating allocations, project the new status onto each affected
-      // charge, so a reader gets the right answer without recomputing from
-      // allocations. The allocations remain the truth; this is a cache.
-      for (const { id, newStatus } of invoiceStatusUpdates) {
-        await tx.updateInvoice(id, { status: newStatus }, params.organizationId)
       }
 
       // ── Step 5: Write the event log, the idempotency anchor ──────────────
@@ -471,7 +489,8 @@ export class BillingService {
         allocated,
         credit: remaining,
       }
-    })
+      })
+    )
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -529,43 +548,58 @@ export class BillingService {
       throw new IdempotencyError(params.idempotencyKey)
     }
 
-    // ── Load the charge ──────────────────────────────────────────────────────
-    const invoice = await this.db.findInvoiceById(
+    // ── Load the charge, to fail fast and to know which account to lock ─────
+    // Everything read here is read again inside the transaction, under the
+    // lock. This pass exists so an obviously bad request does not pay for a
+    // transaction.
+    const preflight = await this.db.findInvoiceById(
       params.invoiceId,
       params.organizationId
     )
-    if (!invoice) {
+    if (!preflight) {
       throw new NotFoundError('Invoice', params.invoiceId)
     }
 
-    // ── Reject unpayable statuses ────────────────────────────────────────────
-    if (invoice.status === 'PAID' || invoice.status === 'VOID') {
-      throw new ValidationError('Invoice is not payable', 'invoiceId')
-    }
-
-    // ── Compute outstanding balance from prior allocations ───────────────────
-    const priorAllocations = await this.db.findAllocationsByInvoice(
-      params.invoiceId,
-      params.organizationId
-    )
-    const priorAllocated: Money = priorAllocations.reduce(
-      (sum, a) => sum + a.amount,
-      0
-    )
-    const outstanding: Money = invoice.amount - priorAllocated
-
-    // ── Cap check: amount must not exceed outstanding ────────────────────────
-    // The targeted flow rejects overpayment. No credit spillover.
-    if (params.amount > outstanding) {
-      throw new ValidationError(
-        `Amount exceeds invoice outstanding (${outstanding})`,
-        'amount'
-      )
-    }
-
     // ── Atomic transaction ───────────────────────────────────────────────────
-    return this.db.runTransaction(async (tx: LedgerStore): Promise<RecordPaymentResult> => {
-      const now = new Date()
+    return this.anchored(params.idempotencyKey, () =>
+      this.db.runTransaction(async (tx: LedgerStore): Promise<RecordPaymentResult> => {
+      // Step 0: Lock the account. The cap check below reads an outstanding
+      // balance and then spends it, so it has to be serialised with every
+      // other operation that allocates on this account.
+      const locked = await tx.lockAccount(preflight.accountId, params.organizationId)
+      if (!locked) {
+        throw new NotFoundError('Account', preflight.accountId)
+      }
+
+      // Re-read under the lock: the charge may have been paid or voided
+      // between the pre-flight and here.
+      const invoice = await tx.findInvoiceById(params.invoiceId, params.organizationId)
+      if (!invoice) {
+        throw new NotFoundError('Invoice', params.invoiceId)
+      }
+      if (invoice.status === 'PAID' || invoice.status === 'VOID') {
+        throw new ValidationError('Invoice is not payable', 'invoiceId')
+      }
+
+      const priorAllocations = await tx.findAllocationsByInvoice(
+        params.invoiceId,
+        params.organizationId
+      )
+      const priorAllocated: Money = priorAllocations.reduce(
+        (sum, a) => sum + a.amount,
+        0
+      )
+      const outstanding: Money = invoice.amount - priorAllocated
+
+      // The targeted flow rejects overpayment. No credit spillover.
+      if (params.amount > outstanding) {
+        throw new ValidationError(
+          `Amount exceeds invoice outstanding (${outstanding})`,
+          'amount'
+        )
+      }
+
+      const now = this.clock()
 
       // Step 1: Create the payment record
       const transaction = await tx.createTransaction(
@@ -651,7 +685,8 @@ export class BillingService {
         allocated:     params.amount,
         credit:        0,
       }
-    })
+      })
+    )
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -723,67 +758,83 @@ export class BillingService {
       throw new IdempotencyError(params.idempotencyKey)
     }
 
-    // ── Load the charge ──────────────────────────────────────────────────────
-    const invoice = await this.db.findInvoiceById(
+    // ── Load the charge, to fail fast and to know which account to lock ─────
+    const preflight = await this.db.findInvoiceById(
       params.invoiceId,
       params.organizationId
     )
-    if (!invoice) {
+    if (!preflight) {
       throw new NotFoundError('Invoice', params.invoiceId)
     }
 
-    // ── Resolve which payments settled it ────────────────────────────────────
-    const invoiceAllocations = await this.db.findAllocationsByInvoice(
-      params.invoiceId,
-      params.organizationId
-    )
-    const transactionIds = [...new Set(invoiceAllocations.map(a => a.transactionId))]
-
-    const candidates = await Promise.all(
-      transactionIds.map(id => this.db.findTransactionById(id, params.organizationId))
-    )
-    // Drop already-voided rows defensively: their allocations should have been
-    // deleted, so they should not appear here at all.
-    const payments = candidates.filter(
-      (t): t is NonNullable<typeof t> => t != null && t.voidedAt == null
-    )
-
-    if (payments.length === 0) {
-      throw new ValidationError('No payments to undo on this invoice', 'invoiceId')
-    }
-
-    // ── Load everything each payment touched ─────────────────────────────────
-    const perPayment = await Promise.all(
-      payments.map(async payment => {
-        const [allocations, ledgerEntries] = await Promise.all([
-          this.db.findAllocationsByTransaction(payment.id, params.organizationId),
-          this.db.findLedgerEntriesByTransaction(payment.id, params.organizationId),
-        ])
-
-        // Invariant: a payment can never have allocated more than it received.
-        const totalAllocated: Money = allocations.reduce((sum, a) => sum + a.amount, 0)
-        if (totalAllocated > payment.amount) {
-          throw new Error(
-            `BillingService invariant violation: allocations(${totalAllocated}) exceed payment amount(${payment.amount}) on ${payment.id}`
-          )
+    // ── Atomic transaction ───────────────────────────────────────────────────
+    // Which payments settled this charge, and how much each of them has
+    // allocated, are read under the lock. Read outside it, a payment recorded
+    // in the meantime would be missed and would keep the charge looking paid
+    // after the reversal claimed to clear it.
+    return this.anchored(params.idempotencyKey, () =>
+      this.db.runTransaction(
+      async (tx: LedgerStore): Promise<VoidInvoicePaymentsResult> => {
+        // Step 0: Lock the account this charge belongs to.
+        const locked = await tx.lockAccount(preflight.accountId, params.organizationId)
+        if (!locked) {
+          throw new NotFoundError('Account', preflight.accountId)
         }
 
-        return { payment, allocations, ledgerEntries }
-      })
-    )
+        const invoice = await tx.findInvoiceById(params.invoiceId, params.organizationId)
+        if (!invoice) {
+          throw new NotFoundError('Invoice', params.invoiceId)
+        }
 
-    const allAllocations = perPayment.flatMap(p => p.allocations)
-    const allLedgerEntries = perPayment.flatMap(p => p.ledgerEntries)
+        // ── Resolve which payments settled it ─────────────────────────────
+        const invoiceAllocations = await tx.findAllocationsByInvoice(
+          params.invoiceId,
+          params.organizationId
+        )
+        const transactionIds = [...new Set(invoiceAllocations.map(a => a.transactionId))]
 
-    // Every charge reached by any of these payments, not just the one being
-    // cleared. Allocations are deleted in full (see ALL OR NOTHING above), so a
-    // charge a payment also covered must be re-projected or it would keep
-    // reading as paid.
-    const touchedInvoiceIds = [...new Set(allAllocations.map(a => a.invoiceId))]
+        const candidates = await Promise.all(
+          transactionIds.map(id => tx.findTransactionById(id, params.organizationId))
+        )
+        // Drop already-voided rows defensively: their allocations should have
+        // been deleted, so they should not appear here at all.
+        const payments = candidates.filter(
+          (t): t is NonNullable<typeof t> => t != null && t.voidedAt == null
+        )
 
-    // ── Atomic transaction ───────────────────────────────────────────────────
-    return this.db.runTransaction(
-      async (tx: LedgerStore): Promise<VoidInvoicePaymentsResult> => {
+        if (payments.length === 0) {
+          throw new ValidationError('No payments to undo on this invoice', 'invoiceId')
+        }
+
+        // ── Load everything each payment touched ──────────────────────────
+        const perPayment = await Promise.all(
+          payments.map(async payment => {
+            const [allocations, ledgerEntries] = await Promise.all([
+              tx.findAllocationsByTransaction(payment.id, params.organizationId),
+              tx.findLedgerEntriesByTransaction(payment.id, params.organizationId),
+            ])
+
+            // Invariant: a payment can never have allocated more than it received.
+            const totalAllocated: Money = allocations.reduce((sum, a) => sum + a.amount, 0)
+            if (totalAllocated > payment.amount) {
+              throw new Error(
+                `BillingService invariant violation: allocations(${totalAllocated}) exceed payment amount(${payment.amount}) on ${payment.id}`
+              )
+            }
+
+            return { payment, allocations, ledgerEntries }
+          })
+        )
+
+        const allAllocations = perPayment.flatMap(p => p.allocations)
+        const allLedgerEntries = perPayment.flatMap(p => p.ledgerEntries)
+
+        // Every charge reached by any of these payments, not just the one being
+        // cleared. Allocations are deleted in full (see ALL OR NOTHING above), so
+        // a charge a payment also covered must be re-projected or it would keep
+        // reading as paid.
+        const touchedInvoiceIds = [...new Set(allAllocations.map(a => a.invoiceId))]
+
         // Step 1: Remove the allocations. Snapshotted below, because these rows are
         // the audit trail and they are about to stop existing.
         for (const allocation of allAllocations) {
@@ -898,6 +949,7 @@ export class BillingService {
           ledgerEntriesVoided: allLedgerEntries.length,
         }
       }
+      )
     )
   }
 
@@ -935,65 +987,20 @@ export class BillingService {
       )
     }
 
-    // ── Load and filter open charges: mirrors recordPayment step 2 exactly ──
-    // This filter and sort MUST stay identical to recordPayment's waterfall.
-    // Any divergence breaks the parity invariant.
-    const allInvoices = await this.db.findInvoicesByAccount(
+    // Same loader and same planner as `recordPayment`. Not a copy of the
+    // waterfall: literally the same function, which is why the two cannot
+    // disagree about where money would land.
+    const open = await this.loadOpenCharges(
+      this.db,
       params.accountId,
       params.organizationId
     )
-    const openInvoices = allInvoices
-      .filter(inv =>
-        inv.status === 'PENDING' ||
-        inv.status === 'PARTIALLY_PAID' ||
-        inv.status === 'OVERDUE'
-      )
-      // Ascending by createdAt: oldest unpaid charge first.
-      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
-
-    // ── Walk charges and build steps: mirrors recordPayment step 3 ──────────
-    let remaining: Money = params.amount
-    const steps: AllocationStep[] = []
-
-    for (const invoice of openInvoices) {
-      if (remaining <= 0) break
-
-      // Compute true outstanding by summing prior allocations (as recordPayment)
-      const priorAllocations = await this.db.findAllocationsByInvoice(
-        invoice.id,
-        params.organizationId
-      )
-      const priorAllocated: Money = priorAllocations.reduce(
-        (sum, a) => sum + a.amount,
-        0
-      )
-      const outstanding: Money = invoice.amount - priorAllocated
-
-      // Skip fully-allocated charges with a stale status (same guard as above)
-      if (outstanding <= 0) continue
-
-      const toAllocate: Money = Math.min(remaining, outstanding)
-      const newTotalAllocated: Money = priorAllocated + toAllocate
-      const newStatus: InvoiceStatus =
-        newTotalAllocated >= invoice.amount ? 'PAID' : 'PARTIALLY_PAID'
-
-      steps.push({
-        invoiceId:  invoice.id,
-        month:      invoice.month,
-        outstanding,
-        toAllocate,
-        newStatus,
-      })
-
-      remaining -= toAllocate
-    }
-
-    const totalAllocated: Money = params.amount - remaining
+    const plan = planWaterfall(open, params.amount)
 
     return {
-      steps,
-      totalAllocated,
-      credit: remaining,
+      steps:          plan.steps,
+      totalAllocated: plan.allocated,
+      credit:         plan.credit,
     }
   }
 
@@ -1047,72 +1054,75 @@ export class BillingService {
       throw new IdempotencyError(params.idempotencyKey)
     }
 
-    // ── Compute spendable credit per source payment ──────────────────────────
-    // A payment's unspent amount is its own amount minus everything already
-    // allocated out of it. Two queries, grouped in memory, so no N+1.
-    const [transactions, accountAllocations] = await Promise.all([
-      this.db.findTransactionsByAccount(params.accountId, params.organizationId),
-      this.db.findAllocationsByAccount(params.accountId, params.organizationId),
-    ])
-
-    const spentByTransaction = new Map<string, Money>()
-    for (const allocation of accountAllocations) {
-      spentByTransaction.set(
-        allocation.transactionId,
-        (spentByTransaction.get(allocation.transactionId) ?? 0) + allocation.amount
-      )
-    }
-
-    // Oldest money first: mirrors the oldest-charge-first waterfall.
-    const sources = transactions
-      .map((t) => ({
-        id:        t.id,
-        createdAt: t.createdAt,
-        unspent:   t.amount - (spentByTransaction.get(t.id) ?? 0),
-      }))
-      .filter((s) => s.unspent > 0)
-      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
-
-    const creditBefore: Money = sources.reduce((sum, s) => sum + s.unspent, 0)
-
-    // ── Resolve target charges ───────────────────────────────────────────────
-    const isOpen = (inv: Invoice): boolean =>
-      inv.status === 'PENDING' ||
-      inv.status === 'PARTIALLY_PAID' ||
-      inv.status === 'OVERDUE'
-
-    let targets: Invoice[]
-    if (params.invoiceId) {
-      const invoice = await this.db.findInvoiceById(
-        params.invoiceId,
-        params.organizationId
-      )
-      if (!invoice) {
-        throw new NotFoundError('Invoice', params.invoiceId)
-      }
-      if (!isOpen(invoice)) {
-        throw new ValidationError('Invoice is not payable', 'invoiceId')
-      }
-      targets = [invoice]
-    } else {
-      const allInvoices = await this.db.findInvoicesByAccount(
-        params.accountId,
-        params.organizationId
-      )
-      targets = allInvoices
-        .filter(isOpen)
-        // Oldest unpaid charge first: same ordering as recordPayment.
-        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
-    }
-
-    // Nothing to do. Return early rather than opening a transaction and
-    // burning the idempotency key on a no-op.
-    if (creditBefore <= 0 || targets.length === 0) {
-      return { applied: 0, remainingCredit: creditBefore, invoicesTouched: [] }
+    // ── Fail fast on an account that is not here at all ─────────────────────
+    const account = await this.db.findAccountById(params.accountId, params.organizationId)
+    if (!account) {
+      throw new NotFoundError('Account', params.accountId)
     }
 
     // ── Atomic transaction ───────────────────────────────────────────────────
-    return this.db.runTransaction(async (tx: LedgerStore): Promise<ApplyCreditResult> => {
+    // Unlike the payment paths there is nothing useful to compute before the
+    // lock: every figure here is an unspent balance that this call is about to
+    // spend, so reading it outside the lock would only give a stale answer.
+    return this.anchored(params.idempotencyKey, () =>
+      this.db.runTransaction(async (tx: LedgerStore): Promise<ApplyCreditResult> => {
+      const locked = await tx.lockAccount(params.accountId, params.organizationId)
+      if (!locked) {
+        throw new NotFoundError('Account', params.accountId)
+      }
+
+      // ── Compute spendable credit per source payment ───────────────────────
+      // A payment's unspent amount is its own amount minus everything already
+      // allocated out of it. Two queries, grouped in memory, so no N+1.
+      const [transactions, accountAllocations] = await Promise.all([
+        tx.findTransactionsByAccount(params.accountId, params.organizationId),
+        tx.findAllocationsByAccount(params.accountId, params.organizationId),
+      ])
+
+      const spentByTransaction = new Map<string, Money>()
+      for (const allocation of accountAllocations) {
+        spentByTransaction.set(
+          allocation.transactionId,
+          (spentByTransaction.get(allocation.transactionId) ?? 0) + allocation.amount
+        )
+      }
+
+      // Oldest money first: mirrors the oldest-charge-first waterfall.
+      const sources = transactions
+        .map((t) => ({
+          id:        t.id,
+          createdAt: t.createdAt,
+          unspent:   t.amount - (spentByTransaction.get(t.id) ?? 0),
+        }))
+        .filter((s) => s.unspent > 0)
+        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+
+      const creditBefore: Money = sources.reduce((sum, s) => sum + s.unspent, 0)
+
+      // ── Resolve target charges ────────────────────────────────────────────
+      let targets: Invoice[]
+      if (params.invoiceId) {
+        const invoice = await tx.findInvoiceById(params.invoiceId, params.organizationId)
+        if (!invoice) {
+          throw new NotFoundError('Invoice', params.invoiceId)
+        }
+        if (selectOpenInvoices([invoice]).length === 0) {
+          throw new ValidationError('Invoice is not payable', 'invoiceId')
+        }
+        targets = [invoice]
+      } else {
+        // The same open-charge filter and oldest-first order as the waterfall.
+        targets = selectOpenInvoices(
+          await tx.findInvoicesByAccount(params.accountId, params.organizationId)
+        )
+      }
+
+      // Nothing to do. Return before writing the event row, so a no-op does
+      // not consume the caller's idempotency key.
+      if (creditBefore <= 0 || targets.length === 0) {
+        return { applied: 0, remainingCredit: creditBefore, invoicesTouched: [] }
+      }
+
       let applied: Money = 0
       const invoicesTouched: string[] = []
 
@@ -1194,7 +1204,8 @@ export class BillingService {
       )
 
       return { applied, remainingCredit, invoicesTouched }
-    })
+      })
+    )
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -1202,13 +1213,23 @@ export class BillingService {
   // ───────────────────────────────────────────────────────────────────────────
 
   /**
-   * Calculates an account's running balance from the immutable ledger.
+   * An account's standing credit: money received that no charge has claimed.
    *
    * FORMULA:
-   *   balance = sum(payments) - sum(allocations) - sum(credit notes)
+   *   standing credit = sum(payments) - sum(allocations) - sum(credit notes)
    *
-   * Positive means the account has credit (overpaid, or a credit note was
-   * issued). Negative means it owes money.
+   * Positive means the account has money sitting on it, from an overpayment or
+   * from a payment taken before the charge existed. `applyCredit` is what
+   * spends it. Zero is the normal state.
+   *
+   * Negative is a data fault, not a debt: it means more has been allocated or
+   * credited out than was ever received. It is reported rather than clamped,
+   * because hiding it would hide the fault.
+   *
+   * This is deliberately NOT "what the account owes". Open charges are not in
+   * the formula. What is owed is a property of the charges, and it is read per
+   * charge with `computeBalance` and `computeEffectiveStatus`, or summed over
+   * them by a read model.
    *
    * Nothing is stored. This is recomputed on every call, which is the point:
    * there is no balance column to drift.
@@ -1218,7 +1239,7 @@ export class BillingService {
    * Payments:      [10000, 5000]  -> sum = 15000
    * Allocations:   [10000, 3000]  -> sum = 13000
    * Credit notes:  [1000]         -> sum = 1000
-   * Balance = 15000 - 13000 - 1000 = 1000  (the account has 10.00 of credit)
+   * Standing credit = 15000 - 13000 - 1000 = 1000  (10.00 sitting on account)
    */
   async calculateBalance(
     accountId: string,
@@ -1267,6 +1288,15 @@ export class BillingService {
       )
     }
 
+    // ── Idempotency check (outside transaction, cheap read) ───────────────
+    const existing = await this.db.findEventLogByKey(
+      params.idempotencyKey,
+      params.organizationId
+    )
+    if (existing) {
+      throw new IdempotencyError(params.idempotencyKey)
+    }
+
     // ── Load account ──────────────────────────────────────────────────────
     const account = await this.db.findAccountById(
       params.accountId,
@@ -1277,7 +1307,10 @@ export class BillingService {
     }
 
     // ── Create the credit note and its event row in one transaction ───────
-    return this.db.runTransaction(async (tx: LedgerStore): Promise<CreditNote> => {
+    // No account lock: a credit note allocates nothing and reads no balance,
+    // so there is no read-then-write to serialise.
+    return this.anchored(params.idempotencyKey, () =>
+      this.db.runTransaction(async (tx: LedgerStore): Promise<CreditNote> => {
       const creditNote = await tx.createCreditNote(
         {
           amount:    params.amount,
@@ -1308,7 +1341,8 @@ export class BillingService {
       )
 
       return creditNote
-    })
+      })
+    )
   }
 
   // ───────────────────────────────────────────────────────────────────────────

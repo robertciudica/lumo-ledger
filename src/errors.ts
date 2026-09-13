@@ -8,7 +8,13 @@
  *   purpose so it cannot be caught and rendered as a user-facing message.
  * - Callers catch these and translate them into whatever their transport uses.
  * - Storage errors must be caught at the store implementation boundary and
- *   re-thrown as one of these before crossing back into the ledger.
+ *   re-thrown as `StoreError` or `UniqueViolationError` before crossing back
+ *   into the ledger. A store never lets its driver's error type escape.
+ * - Idempotency has two layers. The pre-flight read of the event log is the
+ *   fast path; the store's unique constraint on (organizationId,
+ *   idempotencyKey) is the guarantee. Both surface to the caller as
+ *   `IdempotencyError`: the services translate a `UniqueViolationError` on
+ *   the event-log write, so a lost race looks the same as a repeated call.
  */
 
 /**
@@ -72,3 +78,34 @@ export class IdempotencyError extends DomainError {
     this.name = 'IdempotencyError'
   }
 }
+
+/**
+ * The store failed. Thrown by a `LedgerStore` implementation in place of its
+ * driver's own error, so the ledger and its callers see one type. `cause`
+ * carries the original.
+ */
+export class StoreError extends DomainError {
+  constructor(message: string, public readonly cause?: unknown) {
+    super(message, 'STORE_ERROR')
+    this.name = 'StoreError'
+  }
+}
+
+/**
+ * A unique constraint rejected a write. `constraint` names it when the store
+ * knows. The services use this to recognise a lost idempotency race on the
+ * event-log key and rethrow it as `IdempotencyError`.
+ */
+export class UniqueViolationError extends StoreError {
+  constructor(message: string, public readonly constraint?: string, cause?: unknown) {
+    super(message, cause)
+    this.name = 'UniqueViolationError'
+    ;(this as { code: string }).code = 'UNIQUE_VIOLATION'
+  }
+}
+
+/**
+ * The constraint name every store MUST report on a duplicate
+ * (organizationId, idempotencyKey), whatever the physical index is called.
+ */
+export const EVENT_LOG_KEY_CONSTRAINT = 'event_log_org_key_uq'

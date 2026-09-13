@@ -17,7 +17,13 @@
  *
  * `runTransaction` must be atomic. The ledger relies on it: the event-log row
  * that anchors idempotency is written inside the same transaction as the data,
- * so that a rollback releases the key.
+ * so that a rollback releases the key. READ COMMITTED is enough, provided
+ * `lockAccount` does what it says: every operation that changes what is
+ * allocated on an account takes that lock first, so two of them cannot read
+ * the same outstanding balance and both spend it.
+ *
+ * Storage failures cross back into the ledger as `StoreError` (or its
+ * subclass `UniqueViolationError`), never as a driver's own error type.
  */
 
 import type { Money } from './money'
@@ -144,7 +150,13 @@ export interface Allocation {
   invoiceId: string
 }
 
-/** A reduction in what an account owes, with no money moving. */
+/**
+ * A reduction in an account's standing credit, with no money moving: cash
+ * handed back for an overpayment, or a correction to money that was recorded
+ * but should not count. It does not touch an open charge. To reduce what is
+ * owed on a charge, reverse the payment or replace the charge; to give money
+ * back, this plus an OUT row on the cash ledger.
+ */
 export interface CreditNote {
   id: string
   amount: Money
@@ -336,6 +348,18 @@ export interface LedgerStore {
   // ── Accounts ──────────────────────────────────────────────────────────────
 
   findAccountById(id: string, organizationId: string): Promise<Account | null>
+
+  /**
+   * MUST take a row lock on the account (SELECT ... FOR UPDATE, or the
+   * equivalent) that lasts until the enclosing `runTransaction` commits or
+   * rolls back. This is what serialises allocation on one account: a second
+   * payment, credit application or reversal for the same account waits here
+   * until the first has committed, then reads the balances it left behind.
+   *
+   * Outside a transaction this is a plain read. Returns null when the account
+   * is not in this tenant, the same as `findAccountById`.
+   */
+  lockAccount(accountId: string, organizationId: string): Promise<Account | null>
 
   // ── Invoices ──────────────────────────────────────────────────────────────
 

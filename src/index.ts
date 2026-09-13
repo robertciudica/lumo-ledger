@@ -12,6 +12,7 @@
 
 // ── Money ────────────────────────────────────────────────────────────────────
 export type { Money } from './money'
+export { money, isMoney } from './money'
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 export {
@@ -21,6 +22,9 @@ export {
   ValidationError,
   ConflictError,
   IdempotencyError,
+  StoreError,
+  UniqueViolationError,
+  EVENT_LOG_KEY_CONSTRAINT,
 } from './errors'
 
 // ── Events ───────────────────────────────────────────────────────────────────
@@ -89,6 +93,13 @@ export {
 } from './receivables/invoice-status'
 export type { HasAmount } from './receivables/invoice-status'
 
+export {
+  planWaterfall,
+  selectOpenInvoices,
+  sumAllocationsByInvoice,
+} from './receivables/waterfall'
+export type { OpenCharge, WaterfallPlan } from './receivables/waterfall'
+
 // ── Cash ledger ──────────────────────────────────────────────────────────────
 export {
   LedgerService,
@@ -97,6 +108,7 @@ export {
   monthKey,
 } from './cash/LedgerService'
 export type {
+  LedgerServiceOptions,
   AddLedgerEntryParams,
   VoidLedgerEntryParams,
   CreateTemplateParams,

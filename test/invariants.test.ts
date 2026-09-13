@@ -14,7 +14,12 @@ import {
   LedgerService,
   InMemoryLedgerStore,
   computeLedgerTotals,
+  IdempotencyError,
+  NotFoundError,
+  UniqueViolationError,
+  EVENT_LOG_KEY_CONSTRAINT,
 } from '../src'
+import type { LedgerStore } from '../src'
 import {
   accountFactory,
   invoiceFactory,
@@ -249,5 +254,213 @@ describe('known gap: currency is carried, never compared', () => {
 
     expect(result.allocated).toBe(5000)
     expect(db.seed.invoices.find(i => i.id === 'inv_eur')?.status).toBe('PAID')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Allocation is serialised per account
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('invariant: every allocating operation locks the account first', () => {
+  // added during extraction, not from Lumo
+  //
+  // The ledger reads an outstanding balance and then spends it. Under two
+  // concurrent callers that is a lost update: both see the charge as open and
+  // both allocate to it. The lock is what makes the read-then-write safe, so
+  // these tests assert it is taken, and taken before anything is read.
+
+  /** Records the order of store calls, and what the account lock returned. */
+  function recordingStore() {
+    const db = new InMemoryLedgerStore()
+    db.reset()
+    const calls: string[] = []
+    const proxy = new Proxy(db, {
+      get(target, prop: string, receiver) {
+        const value = Reflect.get(target, prop, receiver)
+        if (typeof value !== 'function' || prop === 'runTransaction') {
+          return prop === 'runTransaction'
+            ? (fn: (tx: LedgerStore) => Promise<unknown>) => {
+                calls.push('runTransaction')
+                return fn(proxy)
+              }
+            : value
+        }
+        return (...args: unknown[]) => {
+          calls.push(prop)
+          return (value as (...a: unknown[]) => unknown).apply(target, args)
+        }
+      },
+    }) as InMemoryLedgerStore
+    return { db, proxy, calls }
+  }
+
+  const insideTransaction = (calls: string[]) =>
+    calls.slice(calls.indexOf('runTransaction') + 1)
+
+  it('locks the account before writing anything, when recording a payment', async () => {
+    const { db, proxy, calls } = recordingStore()
+    db.seed.accounts.push(accountFactory({ id: 'acc_1', organizationId: ORG }))
+    db.seed.invoices.push(
+      invoiceFactory({ id: 'inv_1', amount: 2000, status: 'PENDING', accountId: 'acc_1', organizationId: ORG })
+    )
+    const billing = new BillingService(proxy, { paymentCategory: PAYMENT_CATEGORY })
+
+    await pay(billing, 'pay_1', 2000)
+
+    expect(insideTransaction(calls)[0]).toBe('lockAccount')
+  })
+
+  it('locks the account before reading balances, when applying credit', async () => {
+    const { db, proxy, calls } = recordingStore()
+    db.seed.accounts.push(accountFactory({ id: 'acc_1', organizationId: ORG }))
+    db.seed.transactions.push(
+      transactionFactory({ id: 'txn_1', amount: 1000, accountId: 'acc_1', organizationId: ORG })
+    )
+    db.seed.invoices.push(
+      invoiceFactory({ id: 'inv_1', amount: 2000, status: 'PENDING', accountId: 'acc_1', organizationId: ORG })
+    )
+    const billing = new BillingService(proxy, { paymentCategory: PAYMENT_CATEGORY })
+
+    await billing.applyCredit({
+      idempotencyKey:   'credit_1',
+      accountId:        'acc_1',
+      actorId:          'operator_1',
+      actorPermissions: MANAGER,
+      organizationId:   ORG,
+    })
+
+    expect(insideTransaction(calls)[0]).toBe('lockAccount')
+  })
+
+  it('locks the account before resolving payments, when reversing', async () => {
+    const { db, proxy, calls } = recordingStore()
+    db.seed.accounts.push(accountFactory({ id: 'acc_1', organizationId: ORG }))
+    db.seed.invoices.push(
+      invoiceFactory({ id: 'inv_1', amount: 2000, status: 'PENDING', accountId: 'acc_1', organizationId: ORG })
+    )
+    const billing = new BillingService(proxy, { paymentCategory: PAYMENT_CATEGORY })
+    await pay(billing, 'pay_1', 2000)
+    calls.length = 0
+
+    await billing.voidInvoicePayments({
+      idempotencyKey:   'undo_1',
+      invoiceId:        'inv_1',
+      actorId:          'operator_1',
+      actorPermissions: MANAGER,
+      organizationId:   ORG,
+    })
+
+    expect(insideTransaction(calls)[0]).toBe('lockAccount')
+  })
+
+  it('refuses the payment when the account vanishes before the lock is taken', async () => {
+    // The pre-flight found the account and the lock did not. A real store hits
+    // this when the row was deleted while this caller waited for the lock.
+    const { db, billing } = setup()
+    db.seed.invoices.push(
+      invoiceFactory({ id: 'inv_1', amount: 2000, status: 'PENDING', accountId: 'acc_1', organizationId: ORG })
+    )
+    db.lockAccount = async () => null
+
+    await expect(pay(billing, 'pay_1', 2000)).rejects.toBeInstanceOf(NotFoundError)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The idempotency race
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('invariant: a lost idempotency race looks like a repeated call', () => {
+  // added during extraction, not from Lumo
+
+  /** A store whose pre-flight idempotency read always misses. */
+  function blindStore() {
+    const db = new InMemoryLedgerStore()
+    db.reset()
+    db.findEventLogByKey = async () => null
+    return db
+  }
+
+  it('reports IdempotencyError when the constraint catches what the read missed', async () => {
+    const db = blindStore()
+    const billing = new BillingService(db, { paymentCategory: PAYMENT_CATEGORY })
+    db.seed.accounts.push(accountFactory({ id: 'acc_1', organizationId: ORG }))
+    db.seed.invoices.push(
+      invoiceFactory({ id: 'inv_1', amount: 2000, status: 'PENDING', accountId: 'acc_1', organizationId: ORG })
+    )
+
+    await pay(billing, 'pay_1', 1000)
+
+    // The pre-flight check is blind, so this reaches the store, and only the
+    // unique constraint stops it. The caller must not be able to tell the
+    // difference between this and a plain repeat.
+    await expect(pay(billing, 'pay_1', 1000)).rejects.toBeInstanceOf(IdempotencyError)
+  })
+
+  it('reports IdempotencyError on a raced cash row too', async () => {
+    const db = blindStore()
+    const cash = new LedgerService(db, TAXONOMY)
+    const entry = {
+      direction:        'OUT' as const,
+      category:         'SUPPLIES',
+      amount:           140,
+      currency:         'USD',
+      actorId:          'operator_1',
+      actorPermissions: MANAGER,
+      organizationId:   ORG,
+    }
+
+    await cash.addEntry({ ...entry, idempotencyKey: 'cash_1' })
+    await expect(cash.addEntry({ ...entry, idempotencyKey: 'cash_1' })).rejects.toBeInstanceOf(
+      IdempotencyError
+    )
+  })
+
+  it('lets a recurring posting that lost the race report "nothing created"', async () => {
+    // Two runs of the daily job for the same month. The constraint decides,
+    // and the loser reports zero rather than failing the whole batch.
+    const db = blindStore()
+    const cash = new LedgerService(db, TAXONOMY, {
+      clock: () => new Date('2026-06-15T12:00:00Z'),
+    })
+
+    await cash.createTemplate({
+      name:             'Office rent',
+      category:         'RENT',
+      amount:           4200,
+      currency:         'USD',
+      dayOfMonth:       1,
+      actorId:          'operator_1',
+      actorPermissions: MANAGER,
+      organizationId:   ORG,
+    })
+
+    const again = await cash.materializeTemplatesForMonth({
+      month:          '2026-06',
+      organizationId: ORG,
+    })
+    expect(again).toBe(0)
+  })
+
+  it('does not swallow a unique violation from any other constraint', async () => {
+    const db = blindStore()
+    const billing = new BillingService(db, { paymentCategory: PAYMENT_CATEGORY })
+    db.seed.accounts.push(accountFactory({ id: 'acc_1', organizationId: ORG }))
+    db.seed.invoices.push(
+      invoiceFactory({ id: 'inv_1', amount: 5000, status: 'PENDING', accountId: 'acc_1', organizationId: ORG })
+    )
+    db.createAllocation = async () => {
+      throw new UniqueViolationError('unique constraint failed', 'some_other_uq')
+    }
+
+    const failure = pay(billing, 'pay_1', 1000)
+    await expect(failure).rejects.toBeInstanceOf(UniqueViolationError)
+    await expect(failure).rejects.not.toBeInstanceOf(IdempotencyError)
+  })
+
+  it('names the event-log constraint the same way in every store', () => {
+    // A store that reports a different constraint name for this violation
+    // silently turns a race into a 500. The name is part of the port.
+    expect(EVENT_LOG_KEY_CONSTRAINT).toBe('event_log_org_key_uq')
   })
 })

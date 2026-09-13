@@ -26,6 +26,8 @@ import {
   ValidationError,
   IdempotencyError,
   ForbiddenError,
+  UniqueViolationError,
+  EVENT_LOG_KEY_CONSTRAINT,
 } from '../errors'
 import { EVENT_TYPES, SYSTEM_ACTOR_ID } from '../events'
 import type { Permission } from '../permissions'
@@ -162,11 +164,46 @@ export function computeLedgerTotals(entries: readonly LedgerEntry[]): LedgerTota
 // Service
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Optional wiring for the cash ledger. */
+export interface LedgerServiceOptions {
+  /**
+   * Source of "now". Defaults to `() => new Date()`. Injected rather than
+   * called directly so a caller can freeze time in a test, or hand the ledger
+   * a clock that is not the process clock.
+   */
+  readonly clock?: () => Date
+}
+
 export class LedgerService {
+  private readonly clock: () => Date
+
   constructor(
     private readonly db: LedgerStore,
-    private readonly taxonomy: CategoryTaxonomy
-  ) {}
+    private readonly taxonomy: CategoryTaxonomy,
+    options: LedgerServiceOptions = {}
+  ) {
+    this.clock = options.clock ?? (() => new Date())
+  }
+
+  /**
+   * Runs the body of a mutating operation and translates a lost idempotency
+   * race into the same error a repeated call gets. See `BillingService` for
+   * the full reasoning: the pre-flight read is the fast path, the store's
+   * unique constraint is the guarantee.
+   */
+  private async anchored<T>(idempotencyKey: string, run: () => Promise<T>): Promise<T> {
+    try {
+      return await run()
+    } catch (error) {
+      if (
+        error instanceof UniqueViolationError &&
+        error.constraint === EVENT_LOG_KEY_CONSTRAINT
+      ) {
+        throw new IdempotencyError(idempotencyKey)
+      }
+      throw error
+    }
+  }
 
   private assertAmount(amount: Money): void {
     if (amount <= 0) {
@@ -204,8 +241,9 @@ export class LedgerService {
       throw new IdempotencyError(params.idempotencyKey)
     }
 
-    return this.db.runTransaction(async (tx: LedgerStore): Promise<LedgerEntry> => {
-      const now = new Date()
+    return this.anchored(params.idempotencyKey, () =>
+      this.db.runTransaction(async (tx: LedgerStore): Promise<LedgerEntry> => {
+      const now = this.clock()
       const entry = await tx.createLedgerEntry(
         {
           direction:      params.direction,
@@ -240,7 +278,8 @@ export class LedgerService {
       )
 
       return entry
-    })
+      })
+    )
   }
 
   /**
@@ -275,7 +314,8 @@ export class LedgerService {
       throw new IdempotencyError(params.idempotencyKey)
     }
 
-    return this.db.runTransaction(async (tx: LedgerStore): Promise<LedgerEntry> => {
+    return this.anchored(params.idempotencyKey, () =>
+      this.db.runTransaction(async (tx: LedgerStore): Promise<LedgerEntry> => {
       const voided = await tx.voidLedgerEntry(
         params.entryId,
         { voidedBy: params.actorId, voidReason: params.voidReason ?? null },
@@ -297,7 +337,8 @@ export class LedgerService {
       )
 
       return voided
-    })
+      })
+    )
   }
 
   /** Defines a recurring expense template (rent, utilities, monthly salary). */
@@ -334,7 +375,7 @@ export class LedgerService {
     // waiting for the daily job. Future-dated days are left for the job: this
     // is a cash ledger, so nothing posts before the money is due. Idempotent,
     // so the job will not double-post the same (template, month).
-    const now = new Date()
+    const now = this.clock()
     if (template.dayOfMonth <= now.getUTCDate()) {
       await this.materializeTemplate(template, monthKey(now), params.organizationId)
     }
@@ -450,7 +491,8 @@ export class LedgerService {
     const occurredAt = new Date(Date.UTC(Number(yearStr), Number(monthStr) - 1, t.dayOfMonth, 9, 0, 0))
     const idempotencyKey = `recurring-expense:${t.id}:${month}`
 
-    await this.db.runTransaction(async (tx: LedgerStore) => {
+    try {
+      await this.db.runTransaction(async (tx: LedgerStore) => {
       await tx.createLedgerEntry(
         {
           direction:      'OUT',
@@ -479,7 +521,19 @@ export class LedgerService {
         },
         organizationId
       )
-    })
+      })
+    } catch (error) {
+      // Two runs of the job raced for the same (template, month). The
+      // constraint decided; the loser reports "nothing created" rather than
+      // failing a batch that has already done the right thing.
+      if (
+        error instanceof UniqueViolationError &&
+        error.constraint === EVENT_LOG_KEY_CONSTRAINT
+      ) {
+        return false
+      }
+      throw error
+    }
     return true
   }
 }

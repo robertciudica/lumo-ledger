@@ -112,7 +112,8 @@ describe('BillingService.calculateBalance', () => {
       creditNoteFactory({ amount: 2000, accountId: 'acc_1', organizationId: ORG })
     )
 
-    // A credit note reduces what is owed: 0 - 0 - 2000
+    // A credit note consumes standing credit: 0 - 0 - 2000. Negative here
+    // means more has been credited out than was ever received.
     expect(await service.calculateBalance('acc_1', ORG)).toBe(-2000)
   })
 

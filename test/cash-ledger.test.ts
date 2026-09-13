@@ -20,6 +20,13 @@ import type { LedgerEntry } from '../src'
 import { ledgerEntryFactory } from '../src/testing/factories'
 import { MANAGER, OPERATOR, READER, TAXONOMY } from './helpers'
 
+/**
+ * A frozen clock on the 15th, injected into the services under test. Fixing
+ * "now" this way rather than with fake timers is only possible because the
+ * ledger takes its clock as a constructor argument.
+ */
+const FIXED_CLOCK = () => new Date('2026-06-15T12:00:00Z')
+
 const base = {
   currency:       'RON',
   organizationId: 'org_1',
@@ -231,16 +238,12 @@ describe('LedgerService recurring templates', () => {
 
   beforeEach(() => {
     // Fixed clock (the 15th) so create-time immediate materialization is
-    // deterministic regardless of the real date the suite runs on.
-    jest.useFakeTimers().setSystemTime(new Date('2026-06-15T12:00:00Z'))
+    // deterministic regardless of the real date the suite runs on. Injected,
+    // not faked globally: the ledger takes its clock as an argument.
     db = new InMemoryLedgerStore()
     db.reset()
-    service = new LedgerService(db, TAXONOMY)
+    service = new LedgerService(db, TAXONOMY, { clock: FIXED_CLOCK })
   })
-  afterEach(() => {
-    jest.useRealTimers()
-  })
-
   const recurringFor = (month: string) =>
     db.seed.ledgerEntries.filter(e => e.source === 'RECURRING' && e.month === month)
 
@@ -321,15 +324,10 @@ describe('LedgerService.updateTemplate()', () => {
   let service: LedgerService
 
   beforeEach(() => {
-    jest.useFakeTimers().setSystemTime(new Date('2026-06-15T12:00:00Z'))
     db = new InMemoryLedgerStore()
     db.reset()
-    service = new LedgerService(db, TAXONOMY)
+    service = new LedgerService(db, TAXONOMY, { clock: FIXED_CLOCK })
   })
-  afterEach(() => {
-    jest.useRealTimers()
-  })
-
   async function seedTemplate() {
     return service.createTemplate({
       ...base, ...manager, name: 'Office rent', category: 'RENT', amount: 4200, dayOfMonth: 1,
@@ -405,15 +403,10 @@ describe('LedgerService.deleteTemplate()', () => {
   let service: LedgerService
 
   beforeEach(() => {
-    jest.useFakeTimers().setSystemTime(new Date('2026-06-15T12:00:00Z'))
     db = new InMemoryLedgerStore()
     db.reset()
-    service = new LedgerService(db, TAXONOMY)
+    service = new LedgerService(db, TAXONOMY, { clock: FIXED_CLOCK })
   })
-  afterEach(() => {
-    jest.useRealTimers()
-  })
-
   it('soft-deletes so future months skip it', async () => {
     const tpl = await service.createTemplate({
       ...base, ...manager, name: 'Utilities', category: 'UTILITIES', amount: 540, dayOfMonth: 5,

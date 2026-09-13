@@ -36,15 +36,15 @@ import type {
   UpdateRecurringExpenseTemplateInput,
   CreateEventLogInput,
 } from '../store'
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Id generator: a simple counter, reset via reset()
-// ─────────────────────────────────────────────────────────────────────────────
-
-let _idCounter = 0
-const genId = () => `mem_${++_idCounter}`
+import { StoreError, UniqueViolationError, EVENT_LOG_KEY_CONSTRAINT } from '../errors'
 
 export class InMemoryLedgerStore implements LedgerStore {
+  /** Per-instance id counter, so two stores in one process never share ids. */
+  private idCounter = 0
+  private genId(): string {
+    return `mem_${++this.idCounter}`
+  }
+
   /** Public so callers can seed rows directly. */
   seed = {
     accounts:     [] as Account[],
@@ -68,7 +68,7 @@ export class InMemoryLedgerStore implements LedgerStore {
       recurringExpenseTemplates: [],
       eventLogs:    [],
     }
-    _idCounter = 0
+    this.idCounter = 0
   }
 
   // ── Transaction support ──────────────────────────────────────────────────
@@ -85,6 +85,15 @@ export class InMemoryLedgerStore implements LedgerStore {
         a => a.id === id && a.organizationId === organizationId
       ) ?? null
     )
+  }
+
+  /**
+   * A plain read. There is nothing to lock: this store is single-threaded and
+   * every await resolves in order, so two operations on one account cannot
+   * interleave inside a transaction. A real store takes a row lock here.
+   */
+  async lockAccount(accountId: string, organizationId: string): Promise<Account | null> {
+    return this.findAccountById(accountId, organizationId)
   }
 
   // ── Invoices ─────────────────────────────────────────────────────────────
@@ -112,7 +121,7 @@ export class InMemoryLedgerStore implements LedgerStore {
   ): Promise<Invoice> {
     const now = new Date()
     const invoice: Invoice = {
-      id:        genId(),
+      id:        this.genId(),
       amount:    data.amount,
       currency:  data.currency,
       status:    data.status,
@@ -139,7 +148,7 @@ export class InMemoryLedgerStore implements LedgerStore {
       inv => inv.id === id && inv.organizationId === organizationId
     )
     if (idx === -1) {
-      throw new Error(`InMemoryLedgerStore.updateInvoice: Invoice not found: ${id}`)
+      throw new StoreError(`InMemoryLedgerStore.updateInvoice: Invoice not found: ${id}`)
     }
     const existing = this.seed.invoices[idx]
     const updated: Invoice = {
@@ -171,7 +180,7 @@ export class InMemoryLedgerStore implements LedgerStore {
   ): Promise<FinancialTransaction> {
     const now = new Date()
     const transaction: FinancialTransaction = {
-      id:             genId(),
+      id:             this.genId(),
       amount:         data.amount,
       currency:       data.currency,
       paymentMethod:  data.paymentMethod,
@@ -214,7 +223,7 @@ export class InMemoryLedgerStore implements LedgerStore {
     const transaction = this.seed.transactions.find(
       t => t.id === id && t.organizationId === organizationId
     )
-    if (!transaction) throw new Error(`Transaction ${id} not found`)
+    if (!transaction) throw new StoreError(`InMemoryLedgerStore.voidTransaction: not found: ${id}`)
     transaction.voidedBy   = data.voidedBy
     transaction.voidedAt   = new Date()
     transaction.voidReason = data.voidReason ?? null
@@ -229,8 +238,18 @@ export class InMemoryLedgerStore implements LedgerStore {
     // tenant column: it is reached through its transaction and its invoice.
     _organizationId: string
   ): Promise<Allocation> {
+    // Mirror the schema's UNIQUE (transaction_id, invoice_id).
+    const duplicate = this.seed.allocations.some(
+      a => a.transactionId === data.transactionId && a.invoiceId === data.invoiceId
+    )
+    if (duplicate) {
+      throw new UniqueViolationError(
+        `unique constraint allocations_txn_invoice_uq failed on (transactionId, invoiceId): ${data.transactionId}, ${data.invoiceId}`,
+        'allocations_txn_invoice_uq'
+      )
+    }
     const allocation: Allocation = {
-      id:            genId(),
+      id:            this.genId(),
       amount:        data.amount,
       createdBy:     data.createdBy,
       createdAt:     new Date(),
@@ -282,7 +301,7 @@ export class InMemoryLedgerStore implements LedgerStore {
     organizationId: string
   ): Promise<CreditNote> {
     const creditNote: CreditNote = {
-      id:        genId(),
+      id:        this.genId(),
       amount:    data.amount,
       currency:  data.currency,
       reason:    data.reason,
@@ -312,7 +331,7 @@ export class InMemoryLedgerStore implements LedgerStore {
     organizationId: string
   ): Promise<LedgerEntry> {
     const entry: LedgerEntry = {
-      id:             genId(),
+      id:             this.genId(),
       direction:      data.direction,
       category:       data.category,
       amount:         data.amount,
@@ -355,7 +374,7 @@ export class InMemoryLedgerStore implements LedgerStore {
       e => e.id === id && e.organizationId === organizationId
     )
     if (!entry) {
-      throw new Error(`InMemoryLedgerStore.voidLedgerEntry: not found: ${id}`)
+      throw new StoreError(`InMemoryLedgerStore.voidLedgerEntry: not found: ${id}`)
     }
     entry.voidedBy = data.voidedBy
     entry.voidedAt = new Date()
@@ -397,7 +416,7 @@ export class InMemoryLedgerStore implements LedgerStore {
     organizationId: string
   ): Promise<RecurringExpenseTemplate> {
     const template: RecurringExpenseTemplate = {
-      id:             genId(),
+      id:             this.genId(),
       name:           data.name,
       category:       data.category,
       amount:         data.amount,
@@ -441,7 +460,7 @@ export class InMemoryLedgerStore implements LedgerStore {
       t => t.id === id && t.organizationId === organizationId
     )
     if (!template) {
-      throw new Error(`InMemoryLedgerStore.updateRecurringExpenseTemplate: not found: ${id}`)
+      throw new StoreError(`InMemoryLedgerStore.updateRecurringExpenseTemplate: not found: ${id}`)
     }
     template.name           = data.name
     template.category       = data.category
@@ -475,12 +494,13 @@ export class InMemoryLedgerStore implements LedgerStore {
       e => e.idempotencyKey === data.idempotencyKey && e.organizationId === organizationId
     )
     if (duplicate) {
-      throw new Error(
-        `InMemoryLedgerStore.createEventLog: unique constraint failed on (organizationId, idempotencyKey): ${organizationId}, ${data.idempotencyKey}`
+      throw new UniqueViolationError(
+        `unique constraint ${EVENT_LOG_KEY_CONSTRAINT} failed on (organizationId, idempotencyKey): ${organizationId}, ${data.idempotencyKey}`,
+        EVENT_LOG_KEY_CONSTRAINT
       )
     }
     const eventLog: EventLog = {
-      id:             genId(),
+      id:             this.genId(),
       type:           data.type,
       payload:        data.payload,
       actorId:        data.actorId,
