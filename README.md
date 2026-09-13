@@ -4,18 +4,19 @@
 [![npm](https://img.shields.io/npm/v/lumo-ledger.svg)](https://www.npmjs.com/package/lumo-ledger)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-The accounting core of [Lumo](https://lumo.dance), a multi-tenant SaaS for
-dance studios, extracted as a standalone package. It runs in production behind
-paying customers, recording what people owe, what they paid, and what money
-moved. The 1.0 release is that logic with the studio-specific names replaced by
-generic ones. 1.1 adds the account lock described under Concurrency, found by
-reviewing the extraction and now being ported back. Not a demo.
+Two ledgers, one append-only event log, every write idempotent and
+tenant-scoped. `BillingService` is the receivables side: charges, payments,
+allocations, standing credit, reversal. `LedgerService` is the cash side: money
+in, money out, recurring expenses. A payment writes to both in one transaction,
+and every mutating call also writes one event row keyed by an idempotency key
+the caller supplies.
 
-There are two ledgers and one event log. `BillingService` is the receivables
-side: charges, payments, allocations, standing credit, reversal. `LedgerService`
-is the cash side: money in, money out, recurring expenses. A payment writes to
-both in one transaction, and every mutating call also writes one event row keyed
-by an idempotency key the caller supplies.
+It is the accounting core of [Lumo](https://lumo.dance), a multi-tenant SaaS
+for dance studios, extracted as a standalone package. It runs in production
+behind paying customers. The 1.0 release is that logic with the studio-specific
+names replaced by generic ones. 1.1 adds the account lock described under
+Concurrency, found by reviewing the extraction and now being ported back. Not a
+demo.
 
 No runtime dependencies. No framework, no ORM, no HTTP layer, no clock of its
 own.
