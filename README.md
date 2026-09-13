@@ -11,32 +11,33 @@ in, money out, recurring expenses. A payment writes to both in one transaction,
 and every mutating call also writes one event row keyed by an idempotency key
 the caller supplies.
 
-It is the accounting core of [Lumo](https://lumo.dance), a multi-tenant SaaS
-for dance studios, extracted as a standalone package. It runs in production
-behind paying customers. The 1.0 release is that logic with the studio-specific
-names replaced by generic ones. 1.1 adds the account lock described under
-Concurrency, found by reviewing the extraction and now being ported back. Not a
-demo.
+This is the accounting core of [Lumo](https://lumo.dance), the SaaS I built for
+dance studios. It has been running in production behind paying customers, and
+I pulled it out as a package because the accounting part is the part I would
+want to reuse, and the part I think is worth reading. 1.0 is the production
+code with the studio names replaced by generic ones. 1.1 adds the account lock
+described under Concurrency, which I found while reviewing the extraction and
+am porting back.
 
 No runtime dependencies. No framework, no ORM, no HTTP layer, no clock of its
 own.
 
 ## Who this is for
 
-- **You are putting billing into a multi-tenant application** and want the
-  accounting part without adopting a billing platform. Bring your own database
-  and your own idea of who a customer is.
+- **You are putting billing into a multi-tenant app** and want the accounting
+  part without adopting a billing platform. Bring your own database and your
+  own idea of who a customer is.
 - **You are writing your own storage layer** and want a port that has been
   through production, plus a contract suite that tells you when your
   implementation is wrong.
-- **You want to read a real ledger.** Most public examples of this are toys.
-  This one has the scars: the comments explain the incidents that produced each
-  rule.
+- **You want to read a real ledger.** Most public examples are toys. The
+  comments in this one say which incident produced each rule.
 
-Lumo is mine and so is the ledger. The extraction was done by a coding agent
-against a written brief and reviewed line by line;
-[`docs/extraction.md`](docs/extraction.md) is that survey, and it records the
-estimate before the work as well as the result after.
+A note on how it was made: I had a coding agent do the extraction against a
+brief I wrote, and I reviewed the result line by line. The design decisions
+below are mine, most of them years older than the agent.
+[`docs/extraction.md`](docs/extraction.md) has the survey, the estimate before
+the work and the result after.
 
 ## Install
 
@@ -267,8 +268,8 @@ join; the money facts are the payment and the charge. Every read path answers "i
 this charge paid?" by summing allocations for one charge id, so deleting them
 makes every view self-heal. A flag would need each of those paths to remember to
 exclude it, and one that forgot would show a charge as paid by money that never
-arrived. The event row keeps a full snapshot, which is what makes the delete
-acceptable.
+arrived. I counted the call sites before deciding: about twenty. The event row
+keeps a full snapshot, which is what makes the delete acceptable.
 
 **The unit of reversal is the charge, not the payment.** A charge settled by two
 partial payments is cleared in one call. People think "this charge is wrong", not
@@ -278,8 +279,8 @@ production this turns fixing a mistyped amount into one action.
 
 **The stored status is a projection, and the allocations are the truth.** Writing
 a status and then ignoring it on read sounds redundant until the column drifts:
-it is written by one path and read by five. `computeEffectiveStatus` is what
-stopped four screens disagreeing about the same charge. Overdue is part of that:
+it is written by one path and read by five. I added `computeEffectiveStatus`
+after four screens disagreed about the same charge. Overdue is part of that:
 nothing writes it, it falls out of the due date at read time, and before that an
 account three weeks late looked identical to one due at month end.
 
@@ -292,7 +293,7 @@ parity test stayed as a regression guard.
 
 **Tenant id is an argument, never ambient.** No request context, no
 async-local storage. Every call site has to say which tenant it means, which is
-the point: a tenant cannot be inherited by accident. Lumo once leaked across
+the point: a tenant cannot be inherited by accident. I once leaked across
 tenants through a table that had no tenant column of its own, and being explicit
 is what made that findable.
 
@@ -308,9 +309,9 @@ escape into the ledger. That is what lets the services tell a lost idempotency
 race from any other failed write, and it means a caller catching `DomainError`
 catches everything this package can throw.
 
-**`Money` is `number`, not a branded type.** The obvious suggestion, and it was
-tried and reverted. It would force a wrap at 200-odd call sites to enforce a
-rule that is already enforced at run time at every entry point, by guards that
+**`Money` is `number`, not a branded type.** The obvious suggestion, and I tried
+it and reverted. It would force a wrap at 200-odd call sites to enforce a rule
+that is already enforced at run time at every entry point, by guards that
 produce a better error than a type would. `money()` is there for callers who
 want the check at their own boundary. The full argument is in
 [`src/money.ts`](src/money.ts).
@@ -319,8 +320,9 @@ want the check at their own boundary. The full argument is in
 its currency, and the only comparison is the one that matters: a payment
 against the charges it is about to settle, and unspent credit against the
 charges it is about to cover. That comparison was missing in 1.0, which meant
-a payment in one currency settled a charge in another at face value. It was
-the one place the ledger did less than a reader would expect, and it is gone.
+a payment in one currency settled a charge in another at face value. Lumo runs
+one currency per studio so it never came up, but it was the one place the
+ledger did less than a reader would expect, and it is gone.
 
 ## Decisions a reader might disagree with
 
