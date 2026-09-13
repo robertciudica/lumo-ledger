@@ -260,18 +260,30 @@ export class InMemoryLedgerStore implements LedgerStore {
     return allocation
   }
 
+  /**
+   * Reached through the invoice, which is what carries the tenant. Filtering
+   * on `invoiceId` alone would return another tenant's rows to a caller who
+   * guessed an id, and nothing above this line could catch it.
+   */
   async findAllocationsByInvoice(
     invoiceId: string,
-    _organizationId: string
+    organizationId: string
   ): Promise<Allocation[]> {
-    return this.seed.allocations.filter(a => a.invoiceId === invoiceId)
+    const visible = this.seed.invoices.some(
+      inv => inv.id === invoiceId && inv.organizationId === organizationId
+    )
+    return visible ? this.seed.allocations.filter(a => a.invoiceId === invoiceId) : []
   }
 
+  /** Reached through the payment, for the same reason. */
   async findAllocationsByTransaction(
     transactionId: string,
-    _organizationId: string
+    organizationId: string
   ): Promise<Allocation[]> {
-    return this.seed.allocations.filter(a => a.transactionId === transactionId)
+    const visible = this.seed.transactions.some(
+      t => t.id === transactionId && t.organizationId === organizationId
+    )
+    return visible ? this.seed.allocations.filter(a => a.transactionId === transactionId) : []
   }
 
   async findAllocationsByAccount(
@@ -288,10 +300,15 @@ export class InMemoryLedgerStore implements LedgerStore {
     return this.seed.allocations.filter(a => accountInvoiceIds.has(a.invoiceId))
   }
 
-  async deleteAllocation(id: string, _organizationId: string): Promise<void> {
-    // A missing row is a no-op, not a throw.
+  /** A missing row, or one in another tenant, is a no-op rather than a throw. */
+  async deleteAllocation(id: string, organizationId: string): Promise<void> {
     const idx = this.seed.allocations.findIndex(a => a.id === id)
-    if (idx >= 0) this.seed.allocations.splice(idx, 1)
+    if (idx < 0) return
+    const parent = this.seed.invoices.find(
+      inv => inv.id === this.seed.allocations[idx].invoiceId
+    )
+    if (parent?.organizationId !== organizationId) return
+    this.seed.allocations.splice(idx, 1)
   }
 
   // ── Credit notes ─────────────────────────────────────────────────────────
