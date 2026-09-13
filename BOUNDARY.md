@@ -1,21 +1,23 @@
 # Public API
 
-Everything below is exported from the package root. Nothing else is.
+Three entry points. `lumo-ledger` is the ledger, `lumo-ledger/testing` is the
+in-memory store and the contract suite, `lumo-ledger/postgres` is the SQL
+store. Nothing else is exported.
 
 ## Services
 
 | Export | Signature | Purpose |
 | --- | --- | --- |
-| `BillingService` | `new BillingService(store: LedgerStore, config: BillingConfig)` | The receivables ledger: charges, payments, allocations, credit. |
+| `BillingService` | `new BillingService(store: LedgerStore, config: BillingConfig)` | The receivables ledger: charges, payments, allocations, credit. `config` carries the cash category payments are booked under, and an optional `clock`. |
 | `BillingService#recordPayment` | `(params: RecordPaymentParams) => Promise<RecordPaymentResult>` | Take money from an account and waterfall it across open charges, oldest first. The remainder stays as credit. |
 | `BillingService#recordPaymentForInvoice` | `(params: RecordPaymentForInvoiceParams) => Promise<RecordPaymentResult>` | Take money against one named charge. Overpayment is rejected. |
 | `BillingService#previewAllocation` | `(params: PreviewAllocationParams) => Promise<PreviewAllocationResult>` | Dry run of the waterfall. Writes nothing. |
 | `BillingService#applyCredit` | `(params: ApplyCreditParams) => Promise<ApplyCreditResult>` | Spend an account's standing credit against its open charges. |
-| `BillingService#calculateBalance` | `(accountId: string, organizationId: string) => Promise<Money>` | Payments minus allocations minus credit notes. Positive means credit on account. |
+| `BillingService#calculateBalance` | `(accountId: string, organizationId: string) => Promise<Money>` | Standing credit: payments minus allocations minus credit notes. Not what the account owes; open charges are not in the formula. |
 | `BillingService#voidInvoicePayments` | `(params: VoidInvoicePaymentsParams) => Promise<VoidInvoicePaymentsResult>` | Reverse every live payment on one charge. The unit is the charge, not the payment. |
 | `BillingService#applyCreditNote` | `(params: ApplyCreditNoteParams) => Promise<CreditNote>` | Reduce what an account owes without money moving. |
 | `BillingService#createManualInvoice` | `(params: CreateManualInvoiceParams) => Promise<Invoice>` | Create a charge with an explicit amount. No pricing logic. |
-| `LedgerService` | `new LedgerService(store: LedgerStore, taxonomy: CategoryTaxonomy)` | The cash ledger: what came in, what went out. |
+| `LedgerService` | `new LedgerService(store: LedgerStore, taxonomy: CategoryTaxonomy, options?: LedgerServiceOptions)` | The cash ledger: what came in, what went out. |
 | `LedgerService#addEntry` | `(params: AddLedgerEntryParams) => Promise<LedgerEntry>` | Record one manual cash row. |
 | `LedgerService#voidEntry` | `(params: VoidLedgerEntryParams) => Promise<LedgerEntry>` | Void a manual row. Rows written by a payment are refused here. |
 | `LedgerService#createTemplate` | `(params: CreateTemplateParams) => Promise<RecurringExpenseTemplate>` | Define a monthly recurring expense. |
@@ -27,6 +29,11 @@ Everything below is exported from the package root. Nothing else is.
 
 | Export | Signature | Purpose |
 | --- | --- | --- |
+| `planWaterfall` | `(open: readonly OpenCharge[], amount: Money) => WaterfallPlan` | Where a payment would land. The one implementation of the algorithm; `recordPayment` commits it and `previewAllocation` displays it. |
+| `selectOpenInvoices` | `(invoices: readonly Invoice[]) => Invoice[]` | The charges still owed, oldest first. |
+| `sumAllocationsByInvoice` | `(allocations) => Map<string, Money>` | Groups allocation amounts by charge, so one query serves every charge. |
+| `money` | `(amount: number, field?: string) => Money` | Validates an amount at your own boundary. Throws `ValidationError`. |
+| `isMoney` | `(value: unknown) => boolean` | The same question without throwing. |
 | `sumAllocations` | `(allocations: readonly HasAmount[]) => number` | What has landed on a charge. |
 | `computeBalance` | `(amount: number, paidAmount: number) => number` | What is still owed. Never negative. |
 | `computeEffectiveStatus` | `(dbStatus, amount, paidAmount, dueDate, now) => InvoiceStatus` | The state to show a human, derived from allocations rather than trusted from the stored column. |
@@ -38,15 +45,26 @@ Everything below is exported from the package root. Nothing else is.
 
 ## Storage
 
-| Export | Kind | Purpose |
-| --- | --- | --- |
-| `LedgerStore` | interface | The one port. 29 methods, every one takes `organizationId`. |
-| `InMemoryLedgerStore` | class | A complete implementation with no dependencies. Ships in `dist`, not just in tests. |
+| Export | Entry point | Kind | Purpose |
+| --- | --- | --- | --- |
+| `LedgerStore` | `.` | interface | The one port. 30 methods, every one takes `organizationId`. |
+| `InMemoryLedgerStore` | `.`, `./testing` | class | A complete implementation with no dependencies. Proves logic, not atomicity: `runTransaction` does not roll back. |
+| `PostgresLedgerStore` | `./postgres` | class | Postgres, on any driver with `query` and `transaction`. Real transactions, real `SELECT ... FOR UPDATE`. |
+| `pgPoolClient` | `./postgres` | function | Wraps a `pg` pool so a transaction pins one connection. |
+| `SqlClient`, `SqlQueryable`, `PgPoolLike`, `PgClientLike` | `./postgres` | interfaces | The driver shape, so the package depends on no driver. |
+| `runLedgerStoreContractTests` | `./testing` | function | The port's rules as a runnable suite. Point it at your own store. |
+| Entity factories | `./testing` | functions | `accountFactory` and friends, for seeding the in-memory store. |
+| `schema.sql` | `lumo-ledger/schema.sql` | file | The Postgres schema, every constraint annotated with what breaks without it. |
 
 ## Errors
 
 `DomainError` (base, carries `code`), and `NotFoundError`, `ForbiddenError`,
 `ValidationError`, `ConflictError`, `IdempotencyError`.
+
+Thrown by a store rather than by the ledger: `StoreError` (carries `cause`) and
+`UniqueViolationError` (carries `constraint`). `EVENT_LOG_KEY_CONSTRAINT` is
+the name a store must report for a duplicate `(organizationId,
+idempotencyKey)`; the services translate that one into `IdempotencyError`.
 
 ## Types and constants
 
@@ -55,6 +73,8 @@ Everything below is exported from the package root. Nothing else is.
 
 Entities: `Account`, `Invoice`, `FinancialTransaction`, `Allocation`,
 `CreditNote`, `LedgerEntry`, `RecurringExpenseTemplate`, `EventLog`.
+
+Waterfall types: `OpenCharge`, `WaterfallPlan`, `AllocationStep`.
 
 Enums: `InvoiceStatus`, `PaymentMethod`, `CreditNoteReason`, `LedgerDirection`,
 `LedgerSource`.

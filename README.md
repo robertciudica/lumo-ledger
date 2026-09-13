@@ -1,16 +1,54 @@
 # lumo-ledger
 
-The accounting core of [Lumo](https://lumo.dance), a multi-tenant SaaS for dance
-studios, extracted as a standalone package. It runs in production behind paying
-customers, recording what people owe, what they paid, and what money moved. It
-was written and is maintained by one person. This is the same logic, with the
-studio-specific names replaced by generic ones, not a demo.
+[![CI](https://github.com/robertciudica/lumo-ledger/actions/workflows/ci.yml/badge.svg)](https://github.com/robertciudica/lumo-ledger/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/lumo-ledger.svg)](https://www.npmjs.com/package/lumo-ledger)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+The accounting core of [Lumo](https://lumo.dance), a multi-tenant SaaS for
+dance studios, extracted as a standalone package. It runs in production behind
+paying customers, recording what people owe, what they paid, and what money
+moved. This is that logic with the studio-specific names replaced by generic
+ones, not a demo.
 
 There are two ledgers and one event log. `BillingService` is the receivables
 side: charges, payments, allocations, standing credit, reversal. `LedgerService`
 is the cash side: money in, money out, recurring expenses. A payment writes to
 both in one transaction, and every mutating call also writes one event row keyed
 by an idempotency key the caller supplies.
+
+No runtime dependencies. No framework, no ORM, no HTTP layer, no clock of its
+own.
+
+## Who this is for
+
+- **You are putting billing into a multi-tenant application** and want the
+  accounting part without adopting a billing platform. Bring your own database
+  and your own idea of who a customer is.
+- **You are writing your own storage layer** and want a port that has been
+  through production, plus a contract suite that tells you when your
+  implementation is wrong.
+- **You want to read a real ledger.** Most public examples of this are toys.
+  This one has the scars: the comments explain the incidents that produced each
+  rule.
+
+Lumo is mine and so is the ledger. The extraction was done by a coding agent
+against a written brief and reviewed line by line;
+[`docs/extraction.md`](docs/extraction.md) is that survey, and it records the
+estimate before the work as well as the result after.
+
+## Install
+
+```sh
+npm install lumo-ledger
+```
+
+Node 20.11 or newer. Ships ES modules and CommonJS, with types for both.
+
+```ts
+import { BillingService } from 'lumo-ledger'
+import { InMemoryLedgerStore } from 'lumo-ledger/testing'
+import { PostgresLedgerStore } from 'lumo-ledger/postgres'
+```
 
 ## The rules it enforces
 
@@ -21,8 +59,9 @@ by an idempotency key the caller supplies.
 3. **Entries are immutable.** Correcting a cash row is void plus re-add;
    correcting a payment is reverse plus re-record. Voided rows stay, flagged, and
    drop out of the totals.
-4. **Balances are derived, never stored.** A balance is payments minus
-   allocations minus credit notes, recomputed on every call.
+4. **Balances are derived, never stored.** What is owed on a charge is its
+   amount minus its allocations, recomputed on every read. There is no balance
+   column to drift.
 5. **VOID is terminal.** Money landing on a voided charge never resurrects it.
 6. **Every write is idempotent through the event log.** The key is checked before
    the transaction and written inside it, so a rollback releases it.
@@ -31,11 +70,17 @@ by an idempotency key the caller supplies.
 8. **Allocation is oldest first**, for payments and for standing credit.
 9. **Reversal is all or nothing per payment.** A payment that covered three
    charges reopens all three. Un-receiving part of one would break rule 1.
+10. **Allocation is serialised per account.** Every operation that spends an
+    outstanding balance takes a row lock on the account first, so two of them
+    cannot read the same balance and both spend it.
+
+Each rule has a test whose name says which rule it covers.
 
 ## Usage
 
 ```ts
-import { BillingService, InMemoryLedgerStore } from 'lumo-ledger'
+import { BillingService } from 'lumo-ledger'
+import { InMemoryLedgerStore } from 'lumo-ledger/testing'
 
 const store = new InMemoryLedgerStore()
 const billing = new BillingService(store, { paymentCategory: 'SALES' })
@@ -77,7 +122,111 @@ const result = await billing.recordPayment({
 ```
 
 The runnable version, with the cash ledger and assertions, is
-`test/readme-example.test.ts`.
+[`test/readme-example.test.ts`](test/readme-example.test.ts).
+
+Want to show someone where their money would go before taking it?
+`previewAllocation` runs the same planner and writes nothing.
+
+## Storage
+
+The ledger never imports a database driver. Everything goes through one port,
+`LedgerStore`, and you have three ways to satisfy it.
+
+**In memory,** for tests and for seeing how it behaves:
+
+```ts
+import { InMemoryLedgerStore } from 'lumo-ledger/testing'
+const store = new InMemoryLedgerStore()
+```
+
+**On Postgres,** with the schema this package ships:
+
+```ts
+import { Pool } from 'pg'
+import { PostgresLedgerStore, pgPoolClient } from 'lumo-ledger/postgres'
+
+const store = new PostgresLedgerStore(pgPoolClient(new Pool()))
+```
+
+The schema is at [`src/postgres/schema.sql`](src/postgres/schema.sql), and in
+the published package at `lumo-ledger/schema.sql`. Every constraint in it is
+annotated with what breaks without it. Apply it as-is or fold it into your
+migrations; `pg` is not a dependency of this package, it is one of yours.
+
+PGlite works with no adapter at all, which is how the test suite runs Postgres
+without a server:
+
+```ts
+import { PGlite } from '@electric-sql/pglite'
+const store = new PostgresLedgerStore(new PGlite())
+```
+
+**Your own.** The port is 29 methods and every one takes `organizationId`. Two
+of its rules can be broken silently, so do not take my word for it:
+
+```ts
+import { runLedgerStoreContractTests } from 'lumo-ledger/testing'
+
+runLedgerStoreContractTests('MyPrismaStore', async () => {
+  await resetDatabase()
+  return new MyPrismaStore(prisma)
+}, {
+  supportsRollback: true,
+  seedAccount: (id, organizationId) => insertAccountRow(id, organizationId),
+})
+```
+
+It is runner-agnostic: jest, vitest and `node:test` all work. The two rules it
+exists for:
+
+- **`findTransactionsByAccount` must exclude voided payments.** A reversed
+  payment that comes back here reads as standing credit and can be spent again.
+- **`createEventLog` must reject a duplicate `(organizationId,
+  idempotencyKey)`,** reporting `UniqueViolationError` with the constraint named
+  `event_log_org_key_uq`. The pre-flight read is a fast path; the constraint is
+  the guarantee.
+
+Running that suite against the in-memory store that shipped in 1.0 found that
+its allocation reads ignored the tenant. The reference implementation had the
+bug its own documentation warned about, which is the argument for the suite in
+one sentence.
+
+## Concurrency
+
+Two payments for the same account can arrive at the same moment. Both read the
+same charge as open, both allocate their full amount to it, and the charge ends
+up holding more money than it is worth. Nothing raises an error. Somebody finds
+out weeks later.
+
+`lockAccount` is what prevents that. It is the first call inside every
+transaction that allocates, and a store must implement it as a row lock held
+until that transaction commits:
+
+```sql
+SELECT id, organization_id FROM accounts
+ WHERE id = $1 AND organization_id = $2
+   FOR UPDATE
+```
+
+With the lock, the second payment waits, then reads the balances the first one
+left behind and becomes credit instead of a double allocation. READ COMMITTED is
+enough; the lock is doing the work, not the isolation level.
+
+This is tested rather than asserted.
+[`test/postgres-concurrency.test.ts`](test/postgres-concurrency.test.ts) runs
+two connections against a real Postgres and includes the counter-example: the
+same race, with `lockAccount` degraded to a plain read, overpays the charge by
+100%. It skips unless `DATABASE_URL` is set, and CI runs it against Postgres 16
+and 18.
+
+The idempotency race is handled the same way and in two layers. The event log is
+read before the transaction opens, which catches the ordinary repeat cheaply,
+and the unique constraint inside the transaction catches the race the read
+loses. Both reach the caller as `IdempotencyError`, so a retried webhook cannot
+tell the difference and neither should your error handling.
+
+The in-memory store cannot demonstrate any of this. It is single-threaded and
+its `runTransaction` does not roll back, which its doc comment says out loud.
 
 ## Design decisions
 
@@ -102,11 +251,37 @@ stopped four screens disagreeing about the same charge. Overdue is part of that:
 nothing writes it, it falls out of the due date at read time, and before that an
 account three weeks late looked identical to one due at month end.
 
+**Preview and commit are one function.** `previewAllocation` shows where a
+payment would land and `recordPayment` puts it there. They used to be two
+implementations of the same waterfall kept in step by a parity test, which is a
+comment enforced by CI rather than a design. Both now call `planWaterfall`,
+which is pure, takes the open charges and an amount, and returns the plan. The
+parity test stayed as a regression guard.
+
 **Tenant id is an argument, never ambient.** No request context, no
 async-local storage. Every call site has to say which tenant it means, which is
 the point: a tenant cannot be inherited by accident. Lumo once leaked across
 tenants through a table that had no tenant column of its own, and being explicit
 is what made that findable.
+
+**The clock is injected.** `config.clock` defaults to `() => new Date()`.
+Reaching for the process clock inside a ledger makes every test that involves a
+date reach for a global timer mock, and it makes "now" something the caller
+cannot control. Purity where it is cheap: `computeEffectiveStatus` takes `now` as
+a parameter for the same reason.
+
+**Storage errors have types.** A store reports `StoreError`, or
+`UniqueViolationError` with the constraint name, and never lets a driver's error
+escape into the ledger. That is what lets the services tell a lost idempotency
+race from any other failed write, and it means a caller catching `DomainError`
+catches everything this package can throw.
+
+**`Money` is `number`, not a branded type.** The obvious suggestion, and it was
+tried and reverted. It would force a wrap at 200-odd call sites to enforce a
+rule that is already enforced at run time at every entry point, by guards that
+produce a better error than a type would. `money()` is there for callers who
+want the check at their own boundary. The full argument is in
+[`src/money.ts`](src/money.ts).
 
 **Currency travels with every row but is never compared.** A payment in one
 currency will settle a charge in another, at face value. This is a real gap. It
@@ -114,26 +289,55 @@ is characterized by a test rather than fixed here, because fixing it would be
 inventing behaviour the production system does not have. If you run more than one
 currency per tenant, guard it at your edge.
 
+## Known limitations
+
+- **Currency is not checked.** See above. Characterized in
+  `test/invariants.test.ts` under "known gap", so a fix has a test to flip.
+- **`calculateBalance` is standing credit, not what the account owes.** It is
+  payments minus allocations minus credit notes. Open charges are not in the
+  formula; what is owed is a property of the charges, read per charge with
+  `computeEffectiveStatus` or summed by a read model.
+- **`createManualInvoice` has no permission check.** That is how it is in
+  production, where authorization for that path lives in the calling layer.
+- **The in-memory store does not roll back.** It proves logic, not atomicity.
+
 ## What is not here
 
 - **The domain.** Nothing that prices a charge. Pricing decides an amount; this
   takes the amount.
-- **A persistence choice.** One interface, `LedgerStore`, and one in-memory
-  implementation. Lumo's real one is Postgres behind the same interface.
+- **Read models.** The ledger writes events; reporting is built on top.
 - **An HTTP layer.** The package throws typed errors and lets the caller
   translate them.
-- **Read models.** The ledger writes events; reporting is built on top.
+- **Roles.** You pass a permission set; the ledger checks membership. Your org
+  chart is yours.
 
 ## Running it
 
-```
+```sh
 npm install
-npm test        # no database, no network, no env vars
-npm run build   # dist/ with type declarations
+npm test          # no database, no network, no env vars
+npm run typecheck
+npm run lint
+npm run build
 ```
 
-`DISCOVERY.md` is the extraction survey, `BOUNDARY.md` the public API,
-`DECISIONS.md` every judgement call made along the way, and `AGENTS.md` the short
-version for a coding agent.
+The Postgres store is covered by `npm test` alone: PGlite is Postgres compiled
+to WebAssembly, so the SQL, constraints and transactions are real without a
+server. The concurrency tests need two connections and so need a real one:
+
+```sh
+docker run --rm -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:18
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres npm test
+```
+
+## More
+
+- [`docs/extraction.md`](docs/extraction.md): what was taken out of Lumo, what
+  was left, every decision, and what the extraction missed.
+- [`BOUNDARY.md`](BOUNDARY.md): the public API, one line each.
+- [`AGENTS.md`](AGENTS.md): the short version for a coding agent, including the
+  rules a change must not break.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md), [`CHANGELOG.md`](CHANGELOG.md),
+  [`SECURITY.md`](SECURITY.md).
 
 MIT.
