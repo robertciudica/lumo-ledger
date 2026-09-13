@@ -442,3 +442,35 @@ The pattern in all three is the same, and it is the most useful thing I know
 about extracting code: an extraction preserves behaviour, and preserving
 behaviour preserves bugs. The value is not in the moving. It is in reading the
 result somewhere the original context does not come along to explain it.
+
+---
+
+## Appendix: every rule, and the test that holds it
+
+The point of the table is that a rule with no named test is a rule nobody is
+keeping. Rules 1 to 15 are the invariants from section 3; the last two came out
+of the 1.1.0 review.
+
+| Rule | Held by |
+| --- | --- |
+| A posting balances (`allocated + credit === amount`) | `record-payment.test.ts`, plus a property-style case in `waterfall.test.ts` over several amounts |
+| Allocations never exceed the payment they came from | `invariants.test.ts`, which feeds it corrupt state and expects the hard throw |
+| Credit cannot be overspent | the guard in `applyCredit`; the accounting is covered by `apply-credit.test.ts` |
+| Money is integer minor units | every service entry point, in `record-payment`, `create-manual-invoice`, `cash-ledger`, `balance-and-credit-notes`, and `money()` in `waterfall.test.ts` |
+| Entries are immutable | `invariants.test.ts`, both ledgers |
+| Balances are derived, never stored | `balance-and-credit-notes.test.ts`, `invoice-status.test.ts`, `cash-ledger.test.ts` |
+| VOID is terminal | `invoice-status.test.ts`, `void-invoice-payments.test.ts` |
+| Voided rows leave the totals | `cash-ledger.test.ts`, `void-invoice-payments.test.ts`, and the contract suite for both stores |
+| Idempotency anchored in the event log | every mutating suite; the constraint itself in the contract suite; the lost race in `invariants.test.ts` and `postgres-integration.test.ts` |
+| Tenant isolation | the contract suite, method by method, against both stores; plus cases in `record-payment`, `create-manual-invoice`, `cash-ledger` |
+| Allocation is oldest first | `waterfall.test.ts` directly, `record-payment.test.ts` and `apply-credit.test.ts` through the services, and the ordering case in the contract suite |
+| Preview matches commit | one function, `planWaterfall`; `preview-allocation.test.ts` still asserts the two agree |
+| Reversal is all or nothing per payment | `void-invoice-payments.test.ts`, `postgres-integration.test.ts` |
+| A template never posts early or twice | `cash-ledger.test.ts`, `postgres-integration.test.ts` |
+| Editing a template does not touch posted rows | `cash-ledger.test.ts` |
+| Allocation is serialised per account | `invariants.test.ts` for the call order, `postgres-concurrency.test.ts` for the contention, including the counter-example with the lock removed |
+| A store reports failures in the ledger's types | the contract suite, and `invariants.test.ts` for the translation into `IdempotencyError` |
+
+Tests written for this package rather than ported from Lumo carry the comment
+`// added during extraction, not from Lumo`. It is how a reader tells what has
+been running in production from what has not.
