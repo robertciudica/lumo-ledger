@@ -24,7 +24,7 @@ it('README example', async () => {
 
   const actor = {
     actorId: 'user_7',
-    actorPermissions: ['RECORD_PAYMENT', 'ADD_CASHBOOK'] as const,
+    actorPermissions: ['MANAGE_FINANCES', 'RECORD_PAYMENT', 'ADD_CASHBOOK'] as const,
     organizationId: 'tenant_a',
   }
 
@@ -41,6 +41,7 @@ it('README example', async () => {
     description: 'January',
     month:       '2026-01',
     createdBy:   actor.actorId,
+    actorPermissions: actor.actorPermissions,
     organizationId: actor.organizationId,
   })
   const february = await billing.createManualInvoice({
@@ -51,6 +52,7 @@ it('README example', async () => {
     description: 'February',
     month:       '2026-02',
     createdBy:   actor.actorId,
+    actorPermissions: actor.actorPermissions,
     organizationId: actor.organizationId,
   })
 

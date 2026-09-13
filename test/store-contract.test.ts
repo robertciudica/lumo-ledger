@@ -27,9 +27,9 @@ import { PostgresLedgerStore } from '../src/postgres'
 runLedgerStoreContractTests(
   'InMemoryLedgerStore',
   async () => new InMemoryLedgerStore(),
-  // runTransaction calls the callback with `this`: it proves logic, not
-  // atomicity, and the doc comment on the store says so.
-  { supportsRollback: false }
+  // The outermost runTransaction snapshots the tables and restores them on a
+  // throw, so the rollback cases run here too.
+  { supportsRollback: true }
 )
 
 // ── Postgres, through PGlite ─────────────────────────────────────────────────

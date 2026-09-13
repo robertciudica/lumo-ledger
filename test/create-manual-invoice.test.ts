@@ -13,9 +13,9 @@
 
 import { BillingService, InMemoryLedgerStore } from '../src'
 import type { CreateManualInvoiceParams } from '../src'
-import { NotFoundError, ValidationError } from '../src'
+import { NotFoundError, ValidationError, ForbiddenError } from '../src'
 import { accountFactory } from '../src/testing/factories'
-import { PAYMENT_CATEGORY } from './helpers'
+import { MANAGER, OPERATOR, PAYMENT_CATEGORY } from './helpers'
 
 const ORG = 'org_test_1'
 
@@ -41,6 +41,7 @@ const baseParams: Omit<CreateManualInvoiceParams, 'accountId'> = {
   dueDate:        tomorrow(),
   description:    'April pro-rata fee',
   createdBy:      'operator_1',
+  actorPermissions: MANAGER,
   organizationId: ORG,
 }
 
@@ -237,5 +238,20 @@ describe('BillingService.createManualInvoice()', () => {
     await expect(
       service.createManualInvoice({ ...baseParams, accountId: 'acc_1' })
     ).rejects.toThrow(NotFoundError)
+  })
+
+  // ── Permission ────────────────────────────────────────────────────────────
+
+  it('refuses an actor without MANAGE_FINANCES', async () => {
+    // added during extraction, not from Lumo. Creating a charge decides that
+    // somebody owes money; taking money in is a different capability.
+    const { db, service } = makeService()
+    db.seed.accounts.push(accountFactory({ id: 'acc_1', organizationId: ORG }))
+
+    await expect(
+      service.createManualInvoice({ ...baseParams, accountId: 'acc_1', actorPermissions: OPERATOR })
+    ).rejects.toBeInstanceOf(ForbiddenError)
+    expect(db.seed.invoices).toHaveLength(0)
+    expect(db.seed.eventLogs).toHaveLength(0)
   })
 })

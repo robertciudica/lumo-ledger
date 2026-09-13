@@ -9,9 +9,11 @@
  * carry no tenant column of their own (Allocation): they are reached through
  * their parent.
  *
- * Transactions: runTransaction calls the callback with `this`, so transactional
- * and non-transactional code share the same state. Rollback is NOT emulated.
- * This store is for logic and error-path testing, not for proving atomicity.
+ * Transactions: the outermost `runTransaction` snapshots every table before
+ * running the callback and restores the snapshot if it throws, so a failed
+ * operation leaves nothing behind, the same as a real database. A nested call
+ * joins the open transaction. What this does not model is concurrency: there
+ * is one caller at a time, so `lockAccount` has nothing to lock.
  */
 
 import type {
@@ -73,8 +75,45 @@ export class InMemoryLedgerStore implements LedgerStore {
 
   // ── Transaction support ──────────────────────────────────────────────────
 
+  private transactionDepth = 0
+
+  private snapshotSeed(): typeof this.seed {
+    const copy = <T extends object>(rows: T[]): T[] => rows.map(row => ({ ...row }))
+    return {
+      accounts:                  copy(this.seed.accounts),
+      invoices:                  copy(this.seed.invoices),
+      transactions:              copy(this.seed.transactions),
+      allocations:               copy(this.seed.allocations),
+      creditNotes:               copy(this.seed.creditNotes),
+      ledgerEntries:             copy(this.seed.ledgerEntries),
+      recurringExpenseTemplates: copy(this.seed.recurringExpenseTemplates),
+      eventLogs:                 copy(this.seed.eventLogs),
+    }
+  }
+
   async runTransaction<T>(fn: (tx: LedgerStore) => Promise<T>): Promise<T> {
-    return fn(this)
+    if (this.transactionDepth > 0) {
+      return fn(this) // join the open transaction
+    }
+    // Rows are flat objects that are replaced, not mutated in place, apart
+    // from the void and template updates, which assign top-level fields. A
+    // per-row shallow copy is therefore a complete snapshot. structuredClone
+    // would do too, but it hands back arrays from another realm inside a
+    // test sandbox and strict deep-equality then fails on []. Rows handed out
+    // before the snapshot keep pointing at the old objects; the store's own
+    // state is what gets restored.
+    const snapshot = this.snapshotSeed()
+    const counter = this.idCounter
+    this.transactionDepth += 1
+    try {
+      return await fn(this)
+    } catch (error) {
+      this.seed = snapshot
+      this.idCounter = counter
+      throw error
+    } finally {
+      this.transactionDepth -= 1
+    }
   }
 
   // ── Accounts ─────────────────────────────────────────────────────────────

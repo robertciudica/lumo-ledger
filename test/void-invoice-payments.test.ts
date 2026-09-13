@@ -75,7 +75,7 @@ const payTargeted = (
     idempotencyKey:   key,
     invoiceId,
     amount,
-    currency:         'UAH',
+    currency:         'USD',
     paymentMethod:    'CASH',
     payerId:          'payer_1',
     actorId:          'operator_1',
@@ -88,7 +88,7 @@ const payWaterfall = (service: BillingService, key: string, amount: number) =>
     idempotencyKey:   key,
     accountId:        ACCOUNT,
     amount,
-    currency:         'UAH',
+    currency:         'USD',
     paymentMethod:    'CASH',
     payerId:          'payer_1',
     actorId:          'operator_1',
@@ -160,7 +160,7 @@ describe('BillingService.voidInvoicePayments()', () => {
     // only works because the status projection was reset.
     await payTargeted(service, 'pay_right', 'invoice_1', 1000)
     expect(invoiceOf(db, 'invoice_1')?.status).toBe('PARTIALLY_PAID')
-    expect(await service.calculateBalance(ACCOUNT, ORG)).toBe(0)
+    expect(await service.calculateStandingCredit(ACCOUNT, ORG)).toBe(0)
   })
 
   // ── Cross-charge reach ────────────────────────────────────────────────────
@@ -198,7 +198,7 @@ describe('BillingService.voidInvoicePayments()', () => {
     // 5000 received against a 2000 charge: 2000 allocated, 3000 standing credit.
     const paid = await payWaterfall(service, 'pay_1', 5000)
     expect(paid.credit).toBe(3000)
-    expect(await service.calculateBalance(ACCOUNT, ORG)).toBe(3000)
+    expect(await service.calculateStandingCredit(ACCOUNT, ORG)).toBe(3000)
 
     await service.voidInvoicePayments({
       ...baseParams,
@@ -208,7 +208,7 @@ describe('BillingService.voidInvoicePayments()', () => {
 
     // Not 3000, and not 2000. The payment never happened, so there is no
     // credit. This holds only because the store excludes voided payments.
-    expect(await service.calculateBalance(ACCOUNT, ORG)).toBe(0)
+    expect(await service.calculateStandingCredit(ACCOUNT, ORG)).toBe(0)
     expect(invoiceOf(db, 'invoice_1')?.status).toBe('PENDING')
   })
 
@@ -346,7 +346,7 @@ describe('BillingService.voidInvoicePayments()', () => {
       idempotencyKey:   'pay_1',
       invoiceId:        'invoice_1',
       amount:           2000,
-      currency:         'UAH',
+      currency:         'USD',
       paymentMethod:    'CASH',
       payerId:          'payer_1',
       actorId:          'operator_2',

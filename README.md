@@ -75,6 +75,9 @@ import { PostgresLedgerStore } from 'lumo-ledger/postgres'
 10. **Allocation is serialised per account.** Every operation that spends an
     outstanding balance takes a row lock on the account first, so two of them
     cannot read the same balance and both spend it.
+11. **Money settles a charge in the charge's own currency.** There is no
+    exchange rate in a ledger, so a payment never lands on a charge in another
+    currency, and credit is spent in the currency it arrived in.
 
 Each rule has a test whose name says which rule it covers.
 
@@ -89,7 +92,7 @@ const billing = new BillingService(store, { paymentCategory: 'SALES' })
 
 const actor = {
   actorId: 'user_7',
-  actorPermissions: ['RECORD_PAYMENT'] as const,
+  actorPermissions: ['MANAGE_FINANCES', 'RECORD_PAYMENT'] as const,
   organizationId: 'tenant_a',
 }
 
@@ -105,6 +108,7 @@ await billing.createManualInvoice({
   description: 'January',
   month: '2026-01',
   createdBy: actor.actorId,
+  actorPermissions: actor.actorPermissions,
   organizationId: actor.organizationId,
 })
 // ...and the same again for February.
@@ -128,6 +132,9 @@ The runnable version, with the cash ledger and assertions, is
 
 Want to show someone where their money would go before taking it?
 `previewAllocation` runs the same planner and writes nothing.
+
+Creating the charges above needs `MANAGE_FINANCES` and taking the payment needs
+`RECORD_PAYMENT`, which is why the actor holds both.
 
 ## Storage
 
@@ -227,8 +234,9 @@ and the unique constraint inside the transaction catches the race the read
 loses. Both reach the caller as `IdempotencyError`, so a retried webhook cannot
 tell the difference and neither should your error handling.
 
-The in-memory store cannot demonstrate any of this. It is single-threaded and
-its `runTransaction` does not roll back, which its doc comment says out loud.
+The in-memory store cannot demonstrate the lock. It is single-threaded, so
+there is never a second caller to wait. It does roll back, and it passes the
+same contract suite as the Postgres store.
 
 ## Cost per operation
 
@@ -241,7 +249,7 @@ property of the code and does not depend on the machine.
 | `recordPayment`, small payment, 1 to 100 open charges | 9 | nothing |
 | `recordPayment`, covering N charges | 8 + 2N | one insert and one status update per charge it settles |
 | `previewAllocation`, 1 to 100 open charges | 2 | nothing |
-| `calculateBalance` | 3 | nothing |
+| `calculateStandingCredit` | 3 | nothing |
 
 The waterfall loads an account's charges and its allocations in two queries
 and plans in memory, so an account with a hundred open charges costs the same
@@ -307,23 +315,36 @@ produce a better error than a type would. `money()` is there for callers who
 want the check at their own boundary. The full argument is in
 [`src/money.ts`](src/money.ts).
 
-**Currency travels with every row but is never compared.** A payment in one
-currency will settle a charge in another, at face value. This is a real gap. It
-is characterized by a test rather than fixed here, because fixing it would be
-inventing behaviour the production system does not have. If you run more than one
-currency per tenant, guard it at your edge.
+**Currency is checked where money lands, and nowhere else.** Every row carries
+its currency, and the only comparison is the one that matters: a payment
+against the charges it is about to settle, and unspent credit against the
+charges it is about to cover. That comparison was missing in 1.0, which meant
+a payment in one currency settled a charge in another at face value. It was
+the one place the ledger did less than a reader would expect, and it is gone.
 
-## Known limitations
+## Decisions a reader might disagree with
 
-- **Currency is not checked.** See above. Characterized in
-  `test/invariants.test.ts` under "known gap", so a fix has a test to flip.
-- **`calculateBalance` is standing credit, not what the account owes.** It is
-  payments minus allocations minus credit notes. Open charges are not in the
-  formula; what is owed is a property of the charges, read per charge with
-  `computeEffectiveStatus` or summed by a read model.
-- **`createManualInvoice` has no permission check.** That is how it is in
-  production, where authorization for that path lives in the calling layer.
-- **The in-memory store does not roll back.** It proves logic, not atomicity.
+- **Standing credit is not "the balance".** `calculateStandingCredit` is
+  payments minus allocations minus credit notes: money on the account that no
+  charge has claimed. What an account owes is a property of its charges, read
+  per charge with `computeEffectiveStatus` or summed by a read model, and the
+  ledger deliberately has no single number that mixes the two. Until 1.1 the
+  method was called `calculateBalance`, and the name misled people. The old
+  name still works, deprecated, for one minor version.
+- **Creating a charge needs `MANAGE_FINANCES`, not `RECORD_PAYMENT`.** Deciding
+  that somebody owes money is the same capability as reversing a payment or
+  issuing a credit note, and a different one from taking money in.
+- **The in-memory store rolls back but cannot contend.** The outermost
+  `runTransaction` snapshots every table and restores it on a throw, so it
+  passes the same contract suite as the Postgres store, rollback cases
+  included. What it cannot show is two callers at once: there is one, so
+  `lockAccount` has nothing to lock. That is what the real-server test is for.
+- **One currency per allocation, not per tenant.** An account may carry charges
+  in two currencies; it has to be paid in each. The rule is enforced at the
+  point money lands, not at the point a charge is created, so a host that runs
+  one currency never sees it and a host that runs several gets a
+  `ValidationError` naming the field rather than a silent face-value
+  conversion.
 
 ## What is not here
 

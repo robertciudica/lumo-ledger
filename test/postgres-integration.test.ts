@@ -75,6 +75,7 @@ async function charge(month: string, amount: number, dueDate: string) {
     description:    month,
     month,
     createdBy:      'operator_1',
+    actorPermissions: MANAGER,
     organizationId: ORG,
   })
 }
@@ -109,7 +110,7 @@ describe('the ledger on Postgres', () => {
     await charge('2026-02', 5000, '2026-02-28T00:00:00Z')
 
     const preview = await billing.previewAllocation({
-      accountId: 'acc_1', amount: 7000, organizationId: ORG,
+      accountId: 'acc_1', amount: 7000, currency: 'EUR', organizationId: ORG,
     })
     const result = await billing.recordPayment({
       ...actor,
@@ -268,6 +269,7 @@ describe('the ledger on Postgres', () => {
       dueDate:        new Date('2026-04-30T00:00:00Z'),
       description:    'April',
       createdBy:      'operator_1',
+      actorPermissions: MANAGER,
       organizationId: ORG,
     })
 

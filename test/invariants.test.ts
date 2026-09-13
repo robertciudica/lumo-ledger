@@ -197,6 +197,7 @@ describe('invariant: a tenant cannot reach another tenant rows', () => {
     const preview = await billing.previewAllocation({
       accountId:      'acc_1',
       amount:         5000,
+      currency: 'USD',
       organizationId: 'org_1',
     })
 
@@ -222,38 +223,116 @@ describe('invariant: a tenant cannot reach another tenant rows', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// What the ledger does NOT check
+// Money settles a charge in the charge's own currency
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('known gap: currency is carried, never compared', () => {
-  it('allocates a payment to a charge in a different currency', async () => {
-    // This is what production does today. The currency string travels with
-    // every row and nothing compares the two, so a payment in one currency will
-    // settle a charge in another. It is recorded here as a characterization
-    // test rather than fixed, because fixing it would be a behaviour change
-    // that belongs in Lumo first, not in an extraction.
+describe('invariant: a payment settles charges in its own currency only', () => {
+  // added during extraction, not from Lumo
+  //
+  // Until 1.1 this was the one place the ledger did less than a reader would
+  // expect: the currency travelled on every row and nothing compared them, so
+  // a payment in one currency settled a charge in another at face value. There
+  // is no exchange rate in a ledger, so that is not a conversion, it is a
+  // wrong number. Every path that allocates now refuses to cross a currency.
+
+  it('refuses a payment in a different currency from the open charges', async () => {
     const { db, billing } = setup()
     db.seed.invoices.push(
-      invoiceFactory({
-        id: 'inv_eur', amount: 5000, currency: 'EUR',
-        status: 'PENDING', accountId: 'acc_1', organizationId: ORG,
-      })
+      invoiceFactory({ id: 'inv_eur', amount: 5000, currency: 'EUR', status: 'PENDING', accountId: 'acc_1', organizationId: ORG })
     )
 
+    await expect(
+      billing.recordPayment({
+        idempotencyKey:   'pay_usd',
+        accountId:        'acc_1',
+        payerId:          'payer_1',
+        amount:           5000,
+        currency:         'USD',
+        paymentMethod:    'CASH',
+        actorId:          'operator_1',
+        actorPermissions: MANAGER,
+        organizationId:   ORG,
+      })
+    ).rejects.toMatchObject({ name: 'ValidationError', field: 'currency' })
+
+    // Nothing was written: no payment, no allocation, no cash row, no event.
+    expect(db.seed.transactions).toHaveLength(0)
+    expect(db.seed.allocations).toHaveLength(0)
+    expect(db.seed.ledgerEntries).toHaveLength(0)
+    expect(db.seed.eventLogs).toHaveLength(0)
+    expect(db.seed.invoices[0].status).toBe('PENDING')
+  })
+
+  it('refuses a targeted payment in a different currency', async () => {
+    const { db, billing } = setup()
+    db.seed.invoices.push(
+      invoiceFactory({ id: 'inv_eur', amount: 5000, currency: 'EUR', status: 'PENDING', accountId: 'acc_1', organizationId: ORG })
+    )
+
+    await expect(
+      billing.recordPaymentForInvoice({
+        idempotencyKey:   'pay_usd',
+        invoiceId:        'inv_eur',
+        payerId:          'payer_1',
+        amount:           5000,
+        currency:         'USD',
+        paymentMethod:    'CASH',
+        actorId:          'operator_1',
+        actorPermissions: MANAGER,
+        organizationId:   ORG,
+      })
+    ).rejects.toMatchObject({ name: 'ValidationError', field: 'currency' })
+  })
+
+  it('refuses to preview across a currency, the same as it refuses to commit', async () => {
+    const { db, billing } = setup()
+    db.seed.invoices.push(
+      invoiceFactory({ id: 'inv_eur', amount: 5000, currency: 'EUR', status: 'PENDING', accountId: 'acc_1', organizationId: ORG })
+    )
+
+    await expect(
+      billing.previewAllocation({ accountId: 'acc_1', amount: 5000, currency: 'USD', organizationId: ORG })
+    ).rejects.toMatchObject({ name: 'ValidationError', field: 'currency' })
+  })
+
+  it('refuses to spend credit that arrived in another currency', async () => {
+    const { db, billing } = setup()
+    db.seed.transactions.push(
+      transactionFactory({ id: 'txn_usd', amount: 3000, currency: 'USD', accountId: 'acc_1', organizationId: ORG })
+    )
+    db.seed.invoices.push(
+      invoiceFactory({ id: 'inv_eur', amount: 5000, currency: 'EUR', status: 'PENDING', accountId: 'acc_1', organizationId: ORG })
+    )
+
+    await expect(
+      billing.applyCredit({
+        idempotencyKey:   'credit_1',
+        accountId:        'acc_1',
+        actorId:          'operator_1',
+        actorPermissions: MANAGER,
+        organizationId:   ORG,
+      })
+    ).rejects.toMatchObject({ name: 'ValidationError', field: 'currency' })
+    expect(db.seed.allocations).toHaveLength(0)
+  })
+
+  it('still pays an account whose charges match', async () => {
+    const { db, billing } = setup()
+    db.seed.invoices.push(
+      invoiceFactory({ id: 'inv_1', amount: 5000, currency: 'EUR', status: 'PENDING', accountId: 'acc_1', organizationId: ORG })
+    )
     const result = await billing.recordPayment({
-      idempotencyKey:   'pay_usd',
+      idempotencyKey:   'pay_eur',
       accountId:        'acc_1',
       payerId:          'payer_1',
       amount:           5000,
-      currency:         'USD', // not the charge currency
+      currency:         'EUR',
       paymentMethod:    'CASH',
       actorId:          'operator_1',
       actorPermissions: MANAGER,
       organizationId:   ORG,
     })
-
     expect(result.allocated).toBe(5000)
-    expect(db.seed.invoices.find(i => i.id === 'inv_eur')?.status).toBe('PAID')
   })
 })
 

@@ -103,7 +103,7 @@ them, numbers 11 and 12, turned out to need more than a test; see section 6.
    cash row is void plus re-add; correcting a payment is reverse plus re-record.
    Voiding sets metadata and leaves the row. (`LedgerService.voidEntry`,
    `BillingService.voidInvoicePayments`.)
-6. **Balances are derived, never stored as truth.** `calculateBalance` sums
+6. **Balances are derived, never stored as truth.** `calculateStandingCredit` (then `calculateBalance`) sums
    payments minus allocations minus credit notes on every call.
    `computeEffectiveStatus` recomputes an invoice's state from its allocations
    and ignores the stored status column unless the allocations say nothing.
@@ -292,28 +292,32 @@ they need a test fixture. In 1.1.0 it moved to its own entry point,
 `lumo-ledger/testing`, alongside the factories and the contract suite, so a
 production bundle does not carry it.
 
-Rollback is still not emulated, exactly as in Lumo: `runTransaction` calls the
-callback with `this`. The doc comment says so. This store proves logic, not
-atomicity.
+At extraction time rollback was not emulated, exactly as in Lumo:
+`runTransaction` called the callback with `this`. In 1.1 the outermost call
+snapshots the tables and restores them on a throw, so the store passes the
+contract suite's rollback cases too. What it still cannot model is two callers
+at once.
 
 ### 5.8. What was deliberately not fixed
 
-**Currency is never compared.** Every row carries a currency string and nothing
-checks that a payment's currency matches the charge it settles. A payment in USD
-will settle a charge in EUR at face value. This is real, it is in production, and
-it is not fixed here: adding the guard would be inventing a feature and changing
-behaviour I cannot test against production. It is characterized instead, in
-`test/invariants.test.ts` under "known gap", so the behaviour is documented and
-any future fix has a test to flip.
+**Currency was never compared.** Every row carries a currency string and, at
+extraction time, nothing checked that a payment's currency matched the charge it
+settled. A payment in USD would settle a charge in EUR at face value. It was
+characterized rather than fixed during the extraction, because the extraction's
+job was to preserve behaviour. 1.1 fixed it: every path that allocates refuses
+to cross a currency, and the characterization test became the test for the
+rule. Lumo runs one currency per studio, so nothing there ever hit either
+behaviour.
 
 **`OVERDUE` is never written to the stored status.** It is derived from the due
 date at read time in `computeEffectiveStatus`. The waterfall still accepts
 OVERDUE as an input status, because rows imported from another system can carry
 it. Kept as-is.
 
-**`createManualInvoice` has no permission check.** In Lumo the authorization for
-that path lives in the calling layer. Preserved, and noted in AGENTS.md so it is
-not mistaken for an oversight.
+**`createManualInvoice` had no permission check.** In Lumo the authorization
+for that path lives in the calling layer. Preserved during the extraction; 1.1
+requires `MANAGE_FINANCES`, so the ledger's own guard is consistent across every
+method that decides money is owed or not owed.
 
 ### 5.9. Test porting
 
@@ -417,6 +421,7 @@ of the 1.1.0 review.
 | Balances are derived, never stored | `balance-and-credit-notes.test.ts`, `invoice-status.test.ts`, `cash-ledger.test.ts` |
 | VOID is terminal | `invoice-status.test.ts`, `void-invoice-payments.test.ts` |
 | Voided rows leave the totals | `cash-ledger.test.ts`, `void-invoice-payments.test.ts`, and the contract suite for both stores |
+| Money settles a charge in its own currency | `invariants.test.ts`, every allocating path including preview |
 | Idempotency anchored in the event log | every mutating suite; the constraint itself in the contract suite; the lost race in `invariants.test.ts` and `postgres-integration.test.ts` |
 | Tenant isolation | the contract suite, method by method, against both stores; plus cases in `record-payment`, `create-manual-invoice`, `cash-ledger` |
 | Allocation is oldest first | `waterfall.test.ts` directly, `record-payment.test.ts` and `apply-credit.test.ts` through the services, and the ordering case in the contract suite |

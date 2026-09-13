@@ -1,5 +1,5 @@
 /**
- * BillingService.calculateBalance() and applyCreditNote()
+ * BillingService.calculateStandingCredit() and applyCreditNote()
  *
  * Ported from the calculateBalance and applyCreditNote blocks of Lumo's
  * src/core/billing/BillingService.generateInvoice.test.ts. The generateInvoice
@@ -29,16 +29,16 @@ function makeService() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// calculateBalance
+// calculateStandingCredit
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('BillingService.calculateBalance', () => {
+describe('BillingService.calculateStandingCredit', () => {
   it('returns 0 when an account has no payments, allocations or credit notes', async () => {
     const { db, service } = makeService()
     db.seed.accounts.push(accountFactory({ id: 'acc_1', organizationId: ORG }))
     db.seed.invoices.push(invoiceFactory({ accountId: 'acc_1', organizationId: ORG }))
 
-    expect(await service.calculateBalance('acc_1', ORG)).toBe(0)
+    expect(await service.calculateStandingCredit('acc_1', ORG)).toBe(0)
   })
 
   it('returns a positive balance when payments exceed allocations and credit notes', async () => {
@@ -60,7 +60,7 @@ describe('BillingService.calculateBalance', () => {
       creditNoteFactory({ id: 'cn_1', amount: 1000, accountId: 'acc_1', organizationId: ORG })
     )
 
-    expect(await service.calculateBalance('acc_1', ORG)).toBe(1000)
+    expect(await service.calculateStandingCredit('acc_1', ORG)).toBe(1000)
   })
 
   it('returns a negative balance when more is allocated than was received', async () => {
@@ -79,7 +79,7 @@ describe('BillingService.calculateBalance', () => {
       allocationFactory({ id: 'alloc_2', amount: 3000, invoiceId: 'inv_1', transactionId: 'txn_1' })
     )
 
-    expect(await service.calculateBalance('acc_1', ORG)).toBe(-3000)
+    expect(await service.calculateStandingCredit('acc_1', ORG)).toBe(-3000)
   })
 
   it('only counts rows belonging to this tenant', async () => {
@@ -102,7 +102,7 @@ describe('BillingService.calculateBalance', () => {
     )
 
     // Only org_1: 10000 - 10000 - 0
-    expect(await service.calculateBalance('acc_1', 'org_1')).toBe(0)
+    expect(await service.calculateStandingCredit('acc_1', 'org_1')).toBe(0)
   })
 
   it('sums credit notes into the balance', async () => {
@@ -114,7 +114,7 @@ describe('BillingService.calculateBalance', () => {
 
     // A credit note consumes standing credit: 0 - 0 - 2000. Negative here
     // means more has been credited out than was ever received.
-    expect(await service.calculateBalance('acc_1', ORG)).toBe(-2000)
+    expect(await service.calculateStandingCredit('acc_1', ORG)).toBe(-2000)
   })
 
   it('excludes voided payments', async () => {
@@ -129,7 +129,7 @@ describe('BillingService.calculateBalance', () => {
       })
     )
 
-    expect(await service.calculateBalance('acc_1', ORG)).toBe(3000)
+    expect(await service.calculateStandingCredit('acc_1', ORG)).toBe(3000)
   })
 })
 
@@ -252,5 +252,17 @@ describe('BillingService.applyCreditNote', () => {
       actorPermissions: MANAGER,
       organizationId:   ORG,
     })).rejects.toThrow(NotFoundError)
+  })
+
+  it('keeps calculateBalance as a deprecated alias', async () => {
+    // added during extraction, not from Lumo
+    const { db, service } = makeService()
+    db.seed.accounts.push(accountFactory({ id: 'acc_1', organizationId: ORG }))
+    db.seed.transactions.push(
+      transactionFactory({ id: 'txn_1', amount: 1000, accountId: 'acc_1', organizationId: ORG })
+    )
+    expect(await service.calculateBalance('acc_1', ORG)).toBe(
+      await service.calculateStandingCredit('acc_1', ORG)
+    )
   })
 })

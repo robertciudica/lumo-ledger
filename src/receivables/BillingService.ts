@@ -123,6 +123,8 @@ export interface RecordPaymentForInvoiceParams {
 export interface PreviewAllocationParams {
   accountId: string
   amount: Money
+  /** The currency the payment would arrive in. Must match the open charges. */
+  currency: string
   organizationId: string
 }
 
@@ -219,6 +221,7 @@ export interface CreateManualInvoiceParams {
   notes?: string
   /** Who is creating the charge. Used for the event-log audit row. */
   createdBy: string
+  actorPermissions: readonly Permission[]
   organizationId: string
 }
 
@@ -255,6 +258,29 @@ export class BillingService {
       invoice,
       priorAllocated: allocated.get(invoice.id) ?? 0,
     }))
+  }
+
+  /**
+   * Money settles a charge in the charge's own currency, and nothing else.
+   *
+   * There is no exchange rate in a ledger. A payment in one currency landing
+   * on a charge in another at face value is not a conversion, it is a wrong
+   * number, so the waterfall refuses to plan across a currency boundary. An
+   * account that carries charges in two currencies has to be paid in each.
+   */
+  private assertSameCurrency(
+    currency: string,
+    charges: readonly { invoice: Invoice }[] | readonly Invoice[]
+  ): void {
+    for (const item of charges) {
+      const invoice = 'invoice' in item ? item.invoice : item
+      if (invoice.currency !== currency) {
+        throw new ValidationError(
+          `Currency ${currency} does not match charge ${invoice.id} in ${invoice.currency}`,
+          'currency'
+        )
+      }
+    }
   }
 
   /**
@@ -395,6 +421,7 @@ export class BillingService {
 
       // ── Step 2: Load open charges and what has already landed on each ─────
       const open = await this.loadOpenCharges(tx, params.accountId, params.organizationId)
+      this.assertSameCurrency(params.currency, open)
 
       // ── Step 3: Plan the waterfall ────────────────────────────────────────
       // The plan is a pure function of the charges and the amount, and it is
@@ -579,6 +606,7 @@ export class BillingService {
       if (invoice.status === 'PAID' || invoice.status === 'VOID') {
         throw new ValidationError('Invoice is not payable', 'invoiceId')
       }
+      this.assertSameCurrency(params.currency, [invoice])
 
       const priorAllocations = await tx.findAllocationsByInvoice(
         params.invoiceId,
@@ -994,6 +1022,7 @@ export class BillingService {
       params.accountId,
       params.organizationId
     )
+    this.assertSameCurrency(params.currency, open)
     const plan = planWaterfall(open, params.amount)
 
     return {
@@ -1090,6 +1119,7 @@ export class BillingService {
       const sources = transactions
         .map((t) => ({
           id:        t.id,
+          currency:  t.currency,
           createdAt: t.createdAt,
           unspent:   t.amount - (spentByTransaction.get(t.id) ?? 0),
         }))
@@ -1120,6 +1150,13 @@ export class BillingService {
       // not consume the caller's idempotency key.
       if (creditBefore <= 0 || targets.length === 0) {
         return { applied: 0, remainingCredit: creditBefore, invoicesTouched: [] }
+      }
+
+      // Credit is spent in the currency it arrived in. Every unspent payment
+      // has to match every target, or the plan below would move money across
+      // a currency boundary at face value.
+      for (const source of sources) {
+        this.assertSameCurrency(source.currency, targets)
       }
 
       let applied: Money = 0
@@ -1208,7 +1245,7 @@ export class BillingService {
   }
 
   // ───────────────────────────────────────────────────────────────────────────
-  // calculateBalance
+  // calculateStandingCredit
   // ───────────────────────────────────────────────────────────────────────────
 
   /**
@@ -1240,7 +1277,7 @@ export class BillingService {
    * Credit notes:  [1000]         -> sum = 1000
    * Standing credit = 15000 - 13000 - 1000 = 1000  (10.00 sitting on account)
    */
-  async calculateBalance(
+  async calculateStandingCredit(
     accountId: string,
     organizationId: string
   ): Promise<Money> {
@@ -1257,6 +1294,15 @@ export class BillingService {
     const totalCreditNotes: Money = creditNotes.reduce((sum, cn) => sum + cn.amount, 0)
 
     return totalTransactions - totalAllocations - totalCreditNotes
+  }
+
+  /**
+   * @deprecated The name said "balance" and readers took it to mean what the
+   * account owes. It never was: it is the standing credit. Use
+   * `calculateStandingCredit`. This alias is kept for one minor version.
+   */
+  async calculateBalance(accountId: string, organizationId: string): Promise<Money> {
+    return this.calculateStandingCredit(accountId, organizationId)
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -1359,12 +1405,19 @@ export class BillingService {
    * billing for a period that has already closed, which is an ordinary
    * correction.
    *
+   * @throws {ForbiddenError}   if the actor lacks MANAGE_FINANCES
    * @throws {ValidationError}  if amount <= 0 or is not an integer
    * @throws {NotFoundError}    if the account is not in this organization
    */
   async createManualInvoice(
     params: CreateManualInvoiceParams
   ): Promise<Invoice> {
+    // ── Guard: permission ────────────────────────────────────────────────────
+    // Creating a charge is deciding that somebody owes money. That is the
+    // same capability as reversing a payment or issuing a credit note, not the
+    // same as taking money in, so it is MANAGE_FINANCES and not RECORD_PAYMENT.
+    requirePermission(params.actorPermissions, 'MANAGE_FINANCES')
+
     // ── Guard: amount must be a positive integer ─────────────────────────────
     if (params.amount <= 0) {
       throw new ValidationError('Invoice amount must be positive', 'amount')

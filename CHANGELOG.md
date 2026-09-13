@@ -37,6 +37,17 @@ storage port, which was documented rather than enforced.
 
 ### Fixed
 
+- **A payment could settle a charge in another currency at face value.**
+  Every path that allocates now refuses to cross a currency: `recordPayment`,
+  `recordPaymentForInvoice`, `previewAllocation` (which gained a `currency`
+  parameter) and `applyCredit`. The test that characterized the gap became the
+  test for the rule.
+- **`createManualInvoice` had no permission check.** It requires
+  `MANAGE_FINANCES`, and `CreateManualInvoiceParams` gained `actorPermissions`.
+- **`InMemoryLedgerStore` did not roll back.** The outermost `runTransaction`
+  snapshots the tables and restores them on a throw, and the store now passes
+  the contract suite's rollback cases.
+
 - **The in-memory store leaked allocations across tenants.**
   `findAllocationsByInvoice` and `findAllocationsByTransaction` filtered on the
   id alone and ignored `organizationId`, which is the exact failure the port
@@ -64,10 +75,11 @@ storage port, which was documented rather than enforced.
 
 ### Changed
 
-- **`calculateBalance` is documented as standing credit,** which is what it has
+- **`calculateBalance` is `calculateStandingCredit`,** which is what it has
   always computed: payments minus allocations minus credit notes. It is not
-  what the account owes, and open charges are not in the formula. The
-  `CreditNote` doc no longer claims the opposite of the code.
+  what the account owes, and open charges are not in the formula. The old name
+  is a deprecated alias for one minor version. The `CreditNote` doc no longer
+  claims the opposite of the code.
 - **The extraction documents** are one `docs/extraction.md` in the author's
   voice, rather than three files of an agent's working notes.
 - **Jest configuration** is `jest.config.js`. PGlite needs
@@ -77,7 +89,9 @@ storage port, which was documented rather than enforced.
 ### Compatibility
 
 `lockAccount` is a new required method on `LedgerStore`. A store written
-against 1.0 will not compile until it is added. Implementing it as
+against 1.0 will not compile until it is added. `previewAllocation` requires
+`currency` and `createManualInvoice` requires `actorPermissions`; a payment in a
+currency the open charges do not share, which 1.0 accepted, is rejected. Implementing it as
 `findAccountById` restores exactly the old behaviour, which is what the
 in-memory store does, but a store on a real database should take the row lock:
 that is the whole point of the method.

@@ -21,18 +21,18 @@ about tenants:
 - Any path where one tenant can read or write another tenant's rows.
 - An input that gets past the integer-minor-units guards.
 
-## Known limitations, which are not vulnerabilities
+## Deliberate boundaries, which are not vulnerabilities
 
-These are documented in the README and are deliberate:
+These are documented in the README and are design decisions:
 
-- **Currency is carried on every row and never compared.** A payment in one
-  currency will settle a charge in another, at face value. Guard it at your
-  edge if you run more than one currency per tenant.
-- **`InMemoryLedgerStore` does not roll back.** It is for logic tests, not for
-  proving atomicity, and its doc comment says so.
+- **`InMemoryLedgerStore` cannot model two callers at once.** It rolls back,
+  but there is never a second caller for `lockAccount` to hold off. It is for
+  logic tests; the contention test needs a real server.
 - **Authorization is a permission set the caller supplies.** The ledger checks
   membership. Deciding who holds which permission is the caller's job, and so
   is making sure a tenant id never comes from something an end user controls.
+- **Currency is compared where money lands, not where a charge is created.** An
+  account may carry charges in two currencies and must be paid in each.
 
 ## Supported versions
 

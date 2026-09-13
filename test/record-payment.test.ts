@@ -153,7 +153,7 @@ describe('BillingService.recordPayment()', () => {
 
   it('should write the correct payment fields to the store', async () => {
     db.seed.accounts.push(accountFactory())
-    db.seed.invoices.push(invoiceFactory({ amount: 5000, status: 'PENDING' }))
+    db.seed.invoices.push(invoiceFactory({ amount: 5000, status: 'PENDING', currency: 'UAH' }))
 
     await service.recordPayment({
       ...baseParams,

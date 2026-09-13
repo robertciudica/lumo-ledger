@@ -35,6 +35,7 @@ describe('BillingService.previewAllocation()', () => {
     const result = await service.previewAllocation({
       accountId:      'acc_1',
       amount:         6000,
+      currency: 'USD',
       organizationId: 'org_1',
     })
 
@@ -57,6 +58,7 @@ describe('BillingService.previewAllocation()', () => {
     const result = await service.previewAllocation({
       accountId:      'acc_1',
       amount:         5000,
+      currency: 'USD',
       organizationId: 'org_1',
     })
 
@@ -81,6 +83,7 @@ describe('BillingService.previewAllocation()', () => {
     const result = await service.previewAllocation({
       accountId:      'acc_1',
       amount:         12000,
+      currency: 'USD',
       organizationId: 'org_1',
     })
 
@@ -97,6 +100,7 @@ describe('BillingService.previewAllocation()', () => {
     const result = await service.previewAllocation({
       accountId:      'acc_1',
       amount:         5000,
+      currency: 'USD',
       organizationId: 'org_1',
     })
 
@@ -122,6 +126,7 @@ describe('BillingService.previewAllocation()', () => {
     const result = await service.previewAllocation({
       accountId:      'acc_1',
       amount:         6000,
+      currency: 'USD',
       organizationId: 'org_1',
     })
 
@@ -141,6 +146,7 @@ describe('BillingService.previewAllocation()', () => {
     const result = await service.previewAllocation({
       accountId:      'acc_1',
       amount:         5000,
+      currency: 'USD',
       organizationId: 'org_1',
     })
 
@@ -155,6 +161,7 @@ describe('BillingService.previewAllocation()', () => {
     await service.previewAllocation({
       accountId:      'acc_1',
       amount:         5000,
+      currency: 'USD',
       organizationId: 'org_1',
     })
 
@@ -168,19 +175,19 @@ describe('BillingService.previewAllocation()', () => {
 
   it('should throw ValidationError for a zero amount', async () => {
     await expect(
-      service.previewAllocation({ accountId: 'acc_1', amount: 0, organizationId: 'org_1' })
+      service.previewAllocation({ accountId: 'acc_1', amount: 0, currency: 'USD', organizationId: 'org_1' })
     ).rejects.toThrow(ValidationError)
   })
 
   it('should throw ValidationError for a negative amount', async () => {
     await expect(
-      service.previewAllocation({ accountId: 'acc_1', amount: -100, organizationId: 'org_1' })
+      service.previewAllocation({ accountId: 'acc_1', amount: -100, currency: 'USD', organizationId: 'org_1' })
     ).rejects.toThrow(ValidationError)
   })
 
   it('should throw ValidationError for a non-integer amount', async () => {
     await expect(
-      service.previewAllocation({ accountId: 'acc_1', amount: 49.99, organizationId: 'org_1' })
+      service.previewAllocation({ accountId: 'acc_1', amount: 49.99, currency: 'USD', organizationId: 'org_1' })
     ).rejects.toThrow(ValidationError)
   })
 
@@ -218,6 +225,7 @@ describe('BillingService.previewAllocation()', () => {
     const preview = await previewService.previewAllocation({
       accountId:      'acc_1',
       amount:         11000,
+      currency: 'USD',
       organizationId: 'org_1',
     })
 

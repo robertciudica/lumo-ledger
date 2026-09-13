@@ -102,14 +102,14 @@ for (const open of [1, 10, 100]) {
 console.log('\npreviewAllocation, account with N open charges')
 for (const open of [1, 10, 100]) {
   await measure(`   ${String(open).padStart(3)} open charges`, () => reset(open),
-    () => billing.previewAllocation({ accountId: 'acc', amount: 100, organizationId: ORG }))
+    () => billing.previewAllocation({ accountId: 'acc', amount: 100, currency: 'EUR', organizationId: ORG }))
 }
 
-console.log('\ncalculateBalance')
+console.log('\ncalculateStandingCredit')
 await measure('   account with 100 payments', async () => {
   await reset(0)
   for (let i = 0; i < 100; i++) await pay(100)
-}, () => billing.calculateBalance('acc', ORG))
+}, () => billing.calculateStandingCredit('acc', ORG))
 
 console.log(`
 The queries/op column is flat in the number of open charges for recordPayment

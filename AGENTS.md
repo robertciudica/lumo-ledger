@@ -30,7 +30,7 @@ new BillingService(store: LedgerStore, config: { paymentCategory: string, clock?
   recordPaymentForInvoice(params): Promise<{ transactionId, allocated, credit }>
   previewAllocation(params): Promise<{ steps, totalAllocated, credit }>
   applyCredit(params): Promise<{ applied, remainingCredit, invoicesTouched }>
-  calculateBalance(accountId: string, organizationId: string): Promise<number>
+  calculateStandingCredit(accountId: string, organizationId: string): Promise<number>
   voidInvoicePayments(params): Promise<VoidInvoicePaymentsResult>
   applyCreditNote(params): Promise<CreditNote>
   createManualInvoice(params): Promise<Invoice>
@@ -105,6 +105,9 @@ duplicate idempotency key.
     `IdempotencyError`; keep that translation in `anchored()`.
 11. The services take their clock from config. Do not call `new Date()` in
     `src/`, and do not use fake timers in tests.
+12. A payment, a targeted payment, a preview and a credit application all
+    refuse to cross a currency. The check lives in `assertSameCurrency` and
+    runs inside the lock, on the rows it is about to spend.
 
 ## Easy mistakes
 
@@ -120,11 +123,11 @@ duplicate idempotency key.
 - **`PostgresLedgerStore.runTransaction` uses `this.constructor`,** through
   `bindTo`. Constructing the class by name drops a subclass's overrides inside
   transactions, which is where the writes are.
-- `createManualInvoice` has no permission check. That is how it is in
-  production; authorization for that path lives in the caller. Do not "fix" it
-  without being asked.
-- Currency is carried on every row and never compared. That gap is deliberate
-  and characterized in `test/invariants.test.ts`. Do not add a guard silently.
+- `createManualInvoice` requires `MANAGE_FINANCES`, not `RECORD_PAYMENT`.
+  Deciding that somebody owes money is the reversing-and-crediting capability,
+  not the taking-money-in one.
+- Money settles a charge in the charge's own currency only. `assertSameCurrency`
+  runs in every path that allocates, preview included. Do not add a conversion.
 - `applyCredit` writes no cash row. The cash was booked when the payment was
   recorded; adding one double-counts income.
 - A payment holds at most one allocation per charge. `applyCredit` skips a source

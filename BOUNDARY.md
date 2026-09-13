@@ -11,12 +11,12 @@ store. Nothing else is exported.
 | `BillingService` | `new BillingService(store: LedgerStore, config: BillingConfig)` | The receivables ledger: charges, payments, allocations, credit. `config` carries the cash category payments are booked under, and an optional `clock`. |
 | `BillingService#recordPayment` | `(params: RecordPaymentParams) => Promise<RecordPaymentResult>` | Take money from an account and waterfall it across open charges, oldest first. The remainder stays as credit. |
 | `BillingService#recordPaymentForInvoice` | `(params: RecordPaymentForInvoiceParams) => Promise<RecordPaymentResult>` | Take money against one named charge. Overpayment is rejected. |
-| `BillingService#previewAllocation` | `(params: PreviewAllocationParams) => Promise<PreviewAllocationResult>` | Dry run of the waterfall. Writes nothing. |
+| `BillingService#previewAllocation` | `(params: PreviewAllocationParams) => Promise<PreviewAllocationResult>` | Dry run of the waterfall. Writes nothing. Refuses a currency the open charges do not share, the same as `recordPayment`. |
 | `BillingService#applyCredit` | `(params: ApplyCreditParams) => Promise<ApplyCreditResult>` | Spend an account's standing credit against its open charges. |
-| `BillingService#calculateBalance` | `(accountId: string, organizationId: string) => Promise<Money>` | Standing credit: payments minus allocations minus credit notes. Not what the account owes; open charges are not in the formula. |
+| `BillingService#calculateStandingCredit` | `(accountId: string, organizationId: string) => Promise<Money>` | Payments minus allocations minus credit notes: money on the account that no charge has claimed. Not what the account owes. `calculateBalance` is a deprecated alias. |
 | `BillingService#voidInvoicePayments` | `(params: VoidInvoicePaymentsParams) => Promise<VoidInvoicePaymentsResult>` | Reverse every live payment on one charge. The unit is the charge, not the payment. |
 | `BillingService#applyCreditNote` | `(params: ApplyCreditNoteParams) => Promise<CreditNote>` | Reduce what an account owes without money moving. |
-| `BillingService#createManualInvoice` | `(params: CreateManualInvoiceParams) => Promise<Invoice>` | Create a charge with an explicit amount. No pricing logic. |
+| `BillingService#createManualInvoice` | `(params: CreateManualInvoiceParams) => Promise<Invoice>` | Create a charge with an explicit amount. No pricing logic. Needs `MANAGE_FINANCES`. |
 | `LedgerService` | `new LedgerService(store: LedgerStore, taxonomy: CategoryTaxonomy, options?: LedgerServiceOptions)` | The cash ledger: what came in, what went out. |
 | `LedgerService#addEntry` | `(params: AddLedgerEntryParams) => Promise<LedgerEntry>` | Record one manual cash row. |
 | `LedgerService#voidEntry` | `(params: VoidLedgerEntryParams) => Promise<LedgerEntry>` | Void a manual row. Rows written by a payment are refused here. |
@@ -48,7 +48,7 @@ store. Nothing else is exported.
 | Export | Entry point | Kind | Purpose |
 | --- | --- | --- | --- |
 | `LedgerStore` | `.` | interface | The one port. 30 methods, every one takes `organizationId`. |
-| `InMemoryLedgerStore` | `.`, `./testing` | class | A complete implementation with no dependencies. Proves logic, not atomicity: `runTransaction` does not roll back. |
+| `InMemoryLedgerStore` | `.`, `./testing` | class | A complete implementation with no dependencies. Rolls back on a throw; cannot model two callers at once. |
 | `PostgresLedgerStore` | `./postgres` | class | Postgres, on any driver with `query` and `transaction`. Real transactions, real `SELECT ... FOR UPDATE`. |
 | `pgPoolClient` | `./postgres` | function | Wraps a `pg` pool so a transaction pins one connection. |
 | `SqlClient`, `SqlQueryable`, `PgPoolLike`, `PgClientLike` | `./postgres` | interfaces | The driver shape, so the package depends on no driver. |

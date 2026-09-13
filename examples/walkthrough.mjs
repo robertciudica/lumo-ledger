@@ -110,7 +110,7 @@ for (const [month, due] of [['2026-01', '2026-01-31'], ['2026-02', '2026-02-28']
   await billing.createManualInvoice({
     accountId: ACCOUNT, amount: 5000, currency: 'EUR',
     dueDate: new Date(due), description: `${month} tuition`, month,
-    createdBy: actor.actorId, organizationId: ORG,
+    createdBy: actor.actorId, actorPermissions: actor.actorPermissions, organizationId: ORG,
   })
 }
 await showCharges()
@@ -121,7 +121,7 @@ console.log('   path ever wrote OVERDUE: it falls out of the due date when you r
 
 step(2, 'They say they will send €70. Where would it land?')
 
-const preview = await billing.previewAllocation({ accountId: ACCOUNT, amount: 7000, organizationId: ORG })
+const preview = await billing.previewAllocation({ accountId: ACCOUNT, amount: 7000, currency: 'EUR', organizationId: ORG })
 for (const s of preview.steps) {
   console.log(`   ${s.month}  ${eur(s.toAllocate)} of ${eur(s.outstanding)} outstanding  -> ${s.newStatus}`)
 }
@@ -162,14 +162,14 @@ step(5, 'March is billed. They pay €110, which is €30 more than they owe.')
 
 await billing.createManualInvoice({
   accountId: ACCOUNT, amount: 5000, currency: 'EUR', dueDate: new Date('2026-03-31'),
-  description: '2026-03 tuition', month: '2026-03', createdBy: actor.actorId, organizationId: ORG,
+  description: '2026-03 tuition', month: '2026-03', createdBy: actor.actorId, actorPermissions: actor.actorPermissions, organizationId: ORG,
 })
 const over = await billing.recordPayment({
   ...actor, idempotencyKey: 'bank-2026-02-10-c3d4', accountId: ACCOUNT,
   payerId: 'parent_9', amount: 11000, currency: 'EUR', paymentMethod: 'CARD',
 })
 console.log(`   allocated ${eur(over.allocated)} across the open charges, ${eur(over.credit)} had nowhere to go`)
-console.log(`   standing credit on the account: ${eur(await billing.calculateBalance(ACCOUNT, ORG))}`)
+console.log(`   standing credit on the account: ${eur(await billing.calculateStandingCredit(ACCOUNT, ORG))}`)
 await showCharges()
 console.log('   The €30 is real money that is not attached to anything yet.')
 
@@ -177,7 +177,7 @@ step(6, 'April is billed. Spend the credit on it.')
 
 await billing.createManualInvoice({
   accountId: ACCOUNT, amount: 5000, currency: 'EUR', dueDate: new Date('2026-04-30'),
-  description: '2026-04 tuition', month: '2026-04', createdBy: actor.actorId, organizationId: ORG,
+  description: '2026-04 tuition', month: '2026-04', createdBy: actor.actorId, actorPermissions: actor.actorPermissions, organizationId: ORG,
 })
 const applied = await billing.applyCredit({ ...actor, idempotencyKey: 'credit-2026-04-01', accountId: ACCOUNT })
 console.log(`   applied ${eur(applied.applied)} to ${applied.invoicesTouched.length} charge(s), ${eur(applied.remainingCredit)} left on account`)
