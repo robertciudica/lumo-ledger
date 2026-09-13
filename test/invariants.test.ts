@@ -208,7 +208,7 @@ describe('invariant: a tenant cannot reach another tenant rows', () => {
     // An Allocation carries no tenant column. If a store filtered these by id
     // alone, the ledger could not catch it, so this asserts the contract the
     // port documents.
-    const { db, billing } = setup()
+    const { db } = setup()
     db.seed.invoices.push(
       invoiceFactory({ id: 'inv_theirs', amount: 9999, status: 'PENDING', accountId: 'acc_1', organizationId: 'org_2' })
     )

@@ -84,12 +84,15 @@
     "test:watch": "NODE_OPTIONS=\"--experimental-vm-modules --disable-warning=ExperimentalWarning\" jest --watch",
     "test:coverage": "NODE_OPTIONS=\"--experimental-vm-modules --disable-warning=ExperimentalWarning\" jest --coverage",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+    "lint": "biome lint .",
+    "lint:fix": "biome lint --write .",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build"
   },
   "publishConfig": {
     "access": "public"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.13",
     "@electric-sql/pglite": "^0.5.8",
     "@types/jest": "^30.0.0",
     "@types/node": "^22.10.0",

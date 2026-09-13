@@ -28,7 +28,6 @@ import {
   NotFoundError,
   ValidationError,
   IdempotencyError,
-  ForbiddenError,
   UniqueViolationError,
   EVENT_LOG_KEY_CONSTRAINT,
 } from '../errors'
