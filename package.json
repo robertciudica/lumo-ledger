@@ -80,6 +80,7 @@
   ],
   "scripts": {
     "build": "tsup && cp src/postgres/schema.sql dist/schema.sql",
+    "demo": "npm run build --silent && node examples/walkthrough.mjs",
     "test": "NODE_OPTIONS=\"--experimental-vm-modules --disable-warning=ExperimentalWarning\" jest",
     "test:watch": "NODE_OPTIONS=\"--experimental-vm-modules --disable-warning=ExperimentalWarning\" jest --watch",
     "test:coverage": "NODE_OPTIONS=\"--experimental-vm-modules --disable-warning=ExperimentalWarning\" jest --coverage",

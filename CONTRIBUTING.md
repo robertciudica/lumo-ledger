@@ -7,6 +7,7 @@ scope, so the most useful thing to know is what belongs in it.
 
 ```sh
 npm ci
+npm run demo    # the whole ledger end to end, on Postgres in WebAssembly
 npm test        # no database, no network, no environment variables
 npm run lint
 npm run typecheck

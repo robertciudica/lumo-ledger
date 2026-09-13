@@ -311,24 +311,47 @@ currency per tenant, guard it at your edge.
 - **Roles.** You pass a permission set; the ledger checks membership. Your org
   chart is yours.
 
-## Running it
+## Seeing it work
 
 ```sh
 npm install
+npm run demo
+```
+
+`npm run demo` builds the package and runs
+[`examples/walkthrough.mjs`](examples/walkthrough.mjs) against a real Postgres
+compiled to WebAssembly, with no server to start. It bills a customer, previews
+where a payment would land, takes it, replays the webhook, overpays, spends the
+credit, bounces the payment, pays the rent, and prints the event log. Every
+figure it shows is read back out of the database after the step that produced
+it, and it imports the built package rather than the source, so what you are
+watching is what npm would give you.
+
+Point it at your own server to poke at the tables yourself:
+
+```sh
+DATABASE_URL=postgres://localhost/scratch npm run demo
+psql postgres://localhost/scratch -c "select type, jsonb_pretty(payload) from event_log"
+```
+
+## Running the tests
+
+```sh
 npm test          # no database, no network, no env vars
 npm run typecheck
 npm run lint
 npm run build
 ```
 
-The Postgres store is covered by `npm test` alone: PGlite is Postgres compiled
-to WebAssembly, so the SQL, constraints and transactions are real without a
-server. The concurrency tests need two connections and so need a real one:
+The Postgres store is covered by `npm test` alone, through PGlite. The
+concurrency tests need two connections and so need a real server:
 
 ```sh
 docker run --rm -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:18
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres npm test
 ```
+
+Without `DATABASE_URL` those five tests skip and say so.
 
 ## More
 
