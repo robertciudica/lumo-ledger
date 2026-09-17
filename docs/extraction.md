@@ -267,7 +267,7 @@ carries no document, no numbering, no tax handling.
 
 Lumo's storage port covers the whole product: attendance, scheduling,
 memberships, classes. Only the ledger slice came across, renamed to
-`LedgerStore`: 29 methods, every one taking `organizationId`.
+`LedgerStore`: 29 methods, every one taking `organizationId` (30 since 1.1, when `lockAccount` was added).
 
 Two contract notes that were comments in Lumo are now part of the interface
 documentation, because an implementer who misses them gets a silent bug rather

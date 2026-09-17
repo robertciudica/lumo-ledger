@@ -171,7 +171,7 @@ import { PGlite } from '@electric-sql/pglite'
 const store = new PostgresLedgerStore(new PGlite())
 ```
 
-**Your own.** The port is 29 methods and every one takes `organizationId`. Two
+**Your own.** The port is 30 methods and every one takes `organizationId`. Two
 of its rules can be broken silently, so do not take my word for it:
 
 ```ts
