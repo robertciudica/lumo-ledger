@@ -23,6 +23,8 @@ import type {
   CreditNote,
   CreditNoteReason,
   LedgerCategory,
+  FinancialTransaction,
+  Allocation,
 } from '../store'
 import {
   NotFoundError,
@@ -164,6 +166,50 @@ export interface VoidInvoicePaymentsResult {
     status: InvoiceStatus
   }>
   ledgerEntriesVoided: number
+}
+
+export interface ReversePaymentParams {
+  idempotencyKey: string
+  /** The payment that never arrived: bounced, mistyped, recorded twice. */
+  transactionId: string
+  /** Why. Recorded on the payment row and in the event. */
+  reason?: string | null
+  actorId: string
+  actorPermissions: readonly Permission[]
+  organizationId: string
+}
+
+export interface ReversePaymentResult {
+  transactionId: string
+  /** The payment's full amount. A payment is reversed whole or not at all. */
+  amountReversed: Money
+  allocationsRemoved: number
+  /** Every charge the payment had covered, re-projected from what remains. */
+  invoicesReopened: Array<{
+    invoiceId: string
+    month: string | null
+    status: InvoiceStatus
+  }>
+  ledgerEntriesVoided: number
+}
+
+export interface VoidInvoiceParams {
+  idempotencyKey: string
+  /** The charge that should never have been raised, or is no longer owed. */
+  invoiceId: string
+  /** Why. Recorded in the event. */
+  reason?: string | null
+  actorId: string
+  actorPermissions: readonly Permission[]
+  organizationId: string
+}
+
+export interface VoidInvoiceResult {
+  invoiceId: string
+  status: 'VOID'
+  /** Money that had landed on the charge and is now standing credit again. */
+  amountReleased: Money
+  allocationsReleased: number
 }
 
 export interface ApplyCreditNoteParams {
@@ -718,22 +764,342 @@ export class BillingService {
   }
 
   // ───────────────────────────────────────────────────────────────────────────
+  // reversal: the shared mechanics
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Reverses each payment in `payments`, inside a transaction the caller has
+   * already opened and locked. Shared by `reversePayment` (one payment, named
+   * directly) and `voidInvoicePayments` (every payment on a charge).
+   *
+   * A payment is reversed whole: every allocation it funded is removed, every
+   * charge it had covered is re-projected from the allocations that remain,
+   * the payment row is voided in place, and the cash rows it wrote leave the
+   * totals. The caller writes the event row, because the caller knows what
+   * the operation was.
+   */
+  private async reversePaymentsInTx(
+    tx: LedgerStore,
+    payments: readonly FinancialTransaction[],
+    actorId: string,
+    reason: string | null,
+    organizationId: string
+  ) {
+    // ── Load everything each payment touched ────────────────────────────────
+    const perPayment = await Promise.all(
+      payments.map(async payment => {
+        const [allocations, ledgerEntries] = await Promise.all([
+          tx.findAllocationsByTransaction(payment.id, organizationId),
+          tx.findLedgerEntriesByTransaction(payment.id, organizationId),
+        ])
+
+        // Invariant: a payment can never have allocated more than it received.
+        const totalAllocated: Money = sumMoney(allocations.map(a => a.amount))
+        if (totalAllocated > payment.amount) {
+          throw new Error(
+            `BillingService invariant violation: allocations(${totalAllocated}) exceed payment amount(${payment.amount}) on ${payment.id}`
+          )
+        }
+
+        return { payment, allocations, ledgerEntries }
+      })
+    )
+
+    const allAllocations = perPayment.flatMap(p => p.allocations)
+    const allLedgerEntries = perPayment.flatMap(p => p.ledgerEntries)
+
+    // Every charge reached by any of these payments. Allocations are removed
+    // in full, so a charge a payment also covered must be re-projected or it
+    // would keep reading as paid.
+    const touchedInvoiceIds = [...new Set(allAllocations.map(a => a.invoiceId))]
+
+    // Step 1: Remove the allocations. The caller snapshots them into the event
+    // row, because these rows are the audit trail and are about to stop existing.
+    for (const allocation of allAllocations) {
+      await tx.deleteAllocation(allocation.id, organizationId)
+    }
+
+    // Step 2: Re-project each touched charge from what is LEFT, re-read inside
+    // the transaction after the deletes. Another payment may have landed on
+    // this charge in the meantime, and it must survive.
+    const invoicesReopened: Array<{ invoiceId: string; month: string | null; status: InvoiceStatus }> = []
+    for (const invoiceId of touchedInvoiceIds) {
+      const touched = await tx.findInvoiceById(invoiceId, organizationId)
+      if (!touched) continue
+
+      // VOID is terminal: never resurrect a voided charge.
+      if (touched.status === 'VOID') {
+        invoicesReopened.push({ invoiceId, month: touched.month, status: 'VOID' })
+        continue
+      }
+
+      const remaining = await tx.findAllocationsByInvoice(invoiceId, organizationId)
+      const remainingTotal: Money = sumMoney(remaining.map(a => a.amount))
+
+      // Mirrors the projection in recordPayment, run backwards. PENDING, never
+      // OVERDUE: overdue is derived from the due date at read time.
+      const newStatus: InvoiceStatus =
+        remainingTotal >= touched.amount
+          ? 'PAID'
+          : remainingTotal > 0
+            ? 'PARTIALLY_PAID'
+            : 'PENDING'
+
+      if (newStatus !== touched.status) {
+        await tx.updateInvoice(invoiceId, { status: newStatus }, organizationId)
+      }
+      invoicesReopened.push({ invoiceId, month: touched.month, status: newStatus })
+    }
+
+    // Step 3: Void the payments themselves. Deliberately AFTER the allocations,
+    // so a partial failure leaves the charge looking paid (recoverable) rather
+    // than the money looking vanished (silent loss).
+    for (const { payment } of perPayment) {
+      await tx.voidTransaction(payment.id, { voidedBy: actorId, voidReason: reason }, organizationId)
+    }
+
+    // Step 4: Void the matching cash rows. computeLedgerTotals skips voided
+    // rows, so the cash drops out of the month it was booked in, not the
+    // current month. Undoing a January payment in March corrects January.
+    for (const entry of allLedgerEntries) {
+      await tx.voidLedgerEntry(entry.id, { voidedBy: actorId, voidReason: reason }, organizationId)
+    }
+
+    return { perPayment, allAllocations, allLedgerEntries, invoicesReopened }
+  }
+
+  /** The event payload shape shared by both reversal entry points. */
+  private reversalSnapshot(
+    perPayment: ReadonlyArray<{ payment: FinancialTransaction; allocations: readonly Allocation[] }>
+  ) {
+    return perPayment.map(({ payment, allocations }) => ({
+      transactionId: payment.id,
+      amount:        payment.amount,
+      allocations:   allocations.map(a => ({
+        id:        a.id,
+        invoiceId: a.invoiceId,
+        amount:    a.amount,
+        createdBy: a.createdBy,
+        createdAt: a.createdAt.toISOString(),
+      })),
+    }))
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // reversePayment
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Reverses one payment: the money is asserted never to have arrived. A
+   * bounced transfer, a card payment charged back, an amount typed wrong and
+   * re-recorded correctly.
+   *
+   * This is the primitive. `voidInvoicePayments` is the same operation applied
+   * to every payment that landed on one charge, for the operator who found the
+   * problem from the charge's side.
+   *
+   * Reversed whole or not at all. A payment that covered three charges reopens
+   * all three: un-receiving part of a payment would leave the other charges
+   * propped up by money declared never to have arrived, and would break the
+   * invariant that a payment equals its allocations plus its credit.
+   *
+   * This is not a refund and not a correction to a charge. Cash actually
+   * handed back is an OUT row on the cash ledger. A charge that should not
+   * have been raised is `voidInvoice`, which leaves the payment alone.
+   *
+   * @throws {ForbiddenError}   if the actor lacks MANAGE_FINANCES
+   * @throws {IdempotencyError} if this idempotencyKey was already processed
+   * @throws {NotFoundError}    if the payment is not in this organization
+   * @throws {ValidationError}  if the payment is already reversed
+   */
+  async reversePayment(params: ReversePaymentParams): Promise<ReversePaymentResult> {
+    requirePermission(params.actorPermissions, 'MANAGE_FINANCES')
+
+    const existingEvent = await this.db.findEventLogByKey(params.idempotencyKey, params.organizationId)
+    if (existingEvent) {
+      throw new IdempotencyError(params.idempotencyKey)
+    }
+
+    // Fail fast, and learn which account to lock.
+    const preflight = await this.db.findTransactionById(params.transactionId, params.organizationId)
+    if (!preflight) {
+      throw new NotFoundError('FinancialTransaction', params.transactionId)
+    }
+
+    return this.anchored(params.idempotencyKey, () =>
+      this.db.runTransaction(async (tx: LedgerStore): Promise<ReversePaymentResult> => {
+        const locked = await tx.lockAccount(preflight.accountId, params.organizationId)
+        if (!locked) {
+          throw new NotFoundError('Account', preflight.accountId)
+        }
+
+        // Re-read under the lock: it may have been reversed in the meantime.
+        const payment = await tx.findTransactionById(params.transactionId, params.organizationId)
+        if (!payment) {
+          throw new NotFoundError('FinancialTransaction', params.transactionId)
+        }
+        if (payment.voidedAt) {
+          throw new ValidationError('Payment is already reversed', 'transactionId')
+        }
+
+        const reason = params.reason ?? null
+        const { perPayment, allAllocations, allLedgerEntries, invoicesReopened } =
+          await this.reversePaymentsInTx(tx, [payment], params.actorId, reason, params.organizationId)
+
+        await tx.createEventLog(
+          {
+            type:    EVENT_TYPES.TRANSACTION_VOIDED,
+            payload: {
+              transactionId:  payment.id,
+              invoiceId:      null,
+              accountId:      payment.accountId,
+              amount:         payment.amount,
+              currency:       payment.currency,
+              reason,
+              payments:       this.reversalSnapshot(perPayment),
+              invoicesReopened,
+              ledgerEntryIds: allLedgerEntries.map(e => e.id),
+            },
+            actorId:        params.actorId,
+            actorType:      'HUMAN',
+            idempotencyKey: params.idempotencyKey,
+          },
+          params.organizationId
+        )
+
+        return {
+          transactionId:       payment.id,
+          amountReversed:      payment.amount,
+          allocationsRemoved:  allAllocations.length,
+          invoicesReopened,
+          ledgerEntriesVoided: allLedgerEntries.length,
+        }
+      })
+    )
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // voidInvoice
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Voids a charge: it should never have been raised, or is no longer owed.
+   * The payments that had landed on it are untouched. Their money did arrive;
+   * it simply has nothing to cover any more, so it becomes standing credit on
+   * the account, spendable with `applyCredit` or returnable as a cash OUT row.
+   *
+   * This is the other half of reversal. "This charge was wrong" and "this
+   * payment never arrived" are different accounting events, and collapsing
+   * them, which the ledger did until 1.1, meant that clearing a wrong charge
+   * declared a real payment nonexistent and reopened every other charge it
+   * had covered.
+   *
+   * VOID is terminal. Money landing on a voided charge never resurrects it,
+   * and voiding a charge twice is an error rather than a no-op, so a replayed
+   * request cannot mask a real one.
+   *
+   * @throws {ForbiddenError}   if the actor lacks MANAGE_FINANCES
+   * @throws {IdempotencyError} if this idempotencyKey was already processed
+   * @throws {NotFoundError}    if the charge is not in this organization
+   * @throws {ValidationError}  if the charge is already void
+   */
+  async voidInvoice(params: VoidInvoiceParams): Promise<VoidInvoiceResult> {
+    requirePermission(params.actorPermissions, 'MANAGE_FINANCES')
+
+    const existingEvent = await this.db.findEventLogByKey(params.idempotencyKey, params.organizationId)
+    if (existingEvent) {
+      throw new IdempotencyError(params.idempotencyKey)
+    }
+
+    const preflight = await this.db.findInvoiceById(params.invoiceId, params.organizationId)
+    if (!preflight) {
+      throw new NotFoundError('Invoice', params.invoiceId)
+    }
+
+    return this.anchored(params.idempotencyKey, () =>
+      this.db.runTransaction(async (tx: LedgerStore): Promise<VoidInvoiceResult> => {
+        // Releasing allocations changes what the account's payments have left
+        // to spend, so this serialises with everything else that allocates.
+        const locked = await tx.lockAccount(preflight.accountId, params.organizationId)
+        if (!locked) {
+          throw new NotFoundError('Account', preflight.accountId)
+        }
+
+        const invoice = await tx.findInvoiceById(params.invoiceId, params.organizationId)
+        if (!invoice) {
+          throw new NotFoundError('Invoice', params.invoiceId)
+        }
+        if (invoice.status === 'VOID') {
+          throw new ValidationError('Invoice is already void', 'invoiceId')
+        }
+
+        // Release what had landed on it. The payments stay; the joins go.
+        const released = await tx.findAllocationsByInvoice(params.invoiceId, params.organizationId)
+        for (const allocation of released) {
+          await tx.deleteAllocation(allocation.id, params.organizationId)
+        }
+        const amountReleased: Money = sumMoney(released.map(a => a.amount))
+
+        await tx.updateInvoice(params.invoiceId, { status: 'VOID' }, params.organizationId)
+
+        const reason = params.reason ?? null
+        await tx.createEventLog(
+          {
+            type:    EVENT_TYPES.INVOICE_VOIDED,
+            payload: {
+              invoiceId:   invoice.id,
+              accountId:   invoice.accountId,
+              amount:      invoice.amount,
+              currency:    invoice.currency,
+              month:       invoice.month,
+              reason,
+              // Snapshot of the joins removed: which payment had covered what.
+              allocationsReleased: released.map(a => ({
+                id:            a.id,
+                transactionId: a.transactionId,
+                amount:        a.amount,
+                createdBy:     a.createdBy,
+                createdAt:     a.createdAt.toISOString(),
+              })),
+              amountReleased,
+            },
+            actorId:        params.actorId,
+            actorType:      'HUMAN',
+            idempotencyKey: params.idempotencyKey,
+          },
+          params.organizationId
+        )
+
+        return {
+          invoiceId:           invoice.id,
+          status:              'VOID',
+          amountReleased,
+          allocationsReleased: released.length,
+        }
+      })
+    )
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
   // voidInvoicePayments
   // ───────────────────────────────────────────────────────────────────────────
 
   /**
-   * Clears a charge back to unpaid by reversing EVERY payment on it: the money
-   * is asserted never to have arrived.
+   * Reverses EVERY payment that landed on one charge: the money is asserted
+   * never to have arrived. `reversePayment` is the primitive; this is the
+   * same operation for the operator who found the problem from the charge's
+   * side, for instance a charge settled by two transfers that both bounced.
    *
    * This is the reverse of recordPayment and recordPaymentForInvoice, and the
-   * only way to correct a mistyped amount, because a payment's amount is never
-   * mutated. To fix "2000 recorded, 1000 actually paid": undo, then record 1000.
+   * way to correct a mistyped amount, because a payment's amount is never
+   * mutated. To fix "2000 recorded, 1000 actually paid": reverse, then record
+   * 1000.
    *
-   * THE UNIT IS THE CHARGE, NOT THE PAYMENT
-   * ───────────────────────────────────────
-   * A charge settled by two partial payments is cleared by one call. People
-   * think "this charge is wrong", not "the second of the two payments is
-   * wrong", so there is deliberately no way to pick one payment out of several.
+   * NOT FOR A WRONG CHARGE
+   * ──────────────────────
+   * If the charge itself should not exist, the payments that covered it did
+   * arrive and must not be reversed. That is `voidInvoice`, which releases
+   * their allocations to standing credit and leaves the payments alone.
    *
    * WHAT IT TOUCHES
    * ───────────────
@@ -834,101 +1200,8 @@ export class BillingService {
           throw new ValidationError('No payments to undo on this invoice', 'invoiceId')
         }
 
-        // ── Load everything each payment touched ──────────────────────────
-        const perPayment = await Promise.all(
-          payments.map(async payment => {
-            const [allocations, ledgerEntries] = await Promise.all([
-              tx.findAllocationsByTransaction(payment.id, params.organizationId),
-              tx.findLedgerEntriesByTransaction(payment.id, params.organizationId),
-            ])
-
-            // Invariant: a payment can never have allocated more than it received.
-            const totalAllocated: Money = sumMoney(allocations.map(a => a.amount))
-            if (totalAllocated > payment.amount) {
-              throw new Error(
-                `BillingService invariant violation: allocations(${totalAllocated}) exceed payment amount(${payment.amount}) on ${payment.id}`
-              )
-            }
-
-            return { payment, allocations, ledgerEntries }
-          })
-        )
-
-        const allAllocations = perPayment.flatMap(p => p.allocations)
-        const allLedgerEntries = perPayment.flatMap(p => p.ledgerEntries)
-
-        // Every charge reached by any of these payments, not just the one being
-        // cleared. Allocations are deleted in full (see ALL OR NOTHING above), so
-        // a charge a payment also covered must be re-projected or it would keep
-        // reading as paid.
-        const touchedInvoiceIds = [...new Set(allAllocations.map(a => a.invoiceId))]
-
-        // Step 1: Remove the allocations. Snapshotted below, because these rows are
-        // the audit trail and they are about to stop existing.
-        for (const allocation of allAllocations) {
-          await tx.deleteAllocation(allocation.id, params.organizationId)
-        }
-
-        // Step 2: Re-project each touched charge from what is LEFT.
-        //
-        // The remaining total is re-read inside the transaction, after the
-        // deletes, never derived from the list loaded above. Another payment
-        // may have landed on this charge in the meantime, and it must survive.
-        const invoicesReopened: VoidInvoicePaymentsResult['invoicesReopened'] = []
-        for (const invoiceId of touchedInvoiceIds) {
-          const touched = await tx.findInvoiceById(invoiceId, params.organizationId)
-          if (!touched) continue
-
-          // VOID is terminal: never resurrect a voided charge.
-          if (touched.status === 'VOID') {
-            invoicesReopened.push({ invoiceId, month: touched.month, status: 'VOID' })
-            continue
-          }
-
-          const remaining = await tx.findAllocationsByInvoice(invoiceId, params.organizationId)
-          const remainingTotal: Money = sumMoney(remaining.map(a => a.amount))
-
-          // Mirrors the projection in recordPayment, run backwards. PENDING,
-          // never OVERDUE: nothing writes OVERDUE to the stored status, because
-          // overdue is derived from the due date at read time.
-          const newStatus: InvoiceStatus =
-            remainingTotal >= touched.amount
-              ? 'PAID'
-              : remainingTotal > 0
-                ? 'PARTIALLY_PAID'
-                : 'PENDING'
-
-          if (newStatus !== touched.status) {
-            await tx.updateInvoice(invoiceId, { status: newStatus }, params.organizationId)
-          }
-          invoicesReopened.push({ invoiceId, month: touched.month, status: newStatus })
-        }
-
-        // Step 3: Void the payments themselves. Deliberately AFTER the
-        // allocations, so a partial failure leaves the charge looking paid
-        // (recoverable) rather than the money looking vanished (silent loss).
-        //
-        // voidReason is null by design: the caller is not asked why. The column
-        // stays for a future caller that has something worth recording.
-        for (const { payment } of perPayment) {
-          await tx.voidTransaction(
-            payment.id,
-            { voidedBy: params.actorId, voidReason: null },
-            params.organizationId
-          )
-        }
-
-        // Step 4: Void the matching cash rows. computeLedgerTotals skips voided
-        // rows, so the cash drops out of the month it was booked in, not the
-        // current month. Undoing a January payment in March corrects January,
-        // which is the cash-correct answer.
-        for (const entry of allLedgerEntries) {
-          await tx.voidLedgerEntry(
-            entry.id,
-            { voidedBy: params.actorId, voidReason: null },
-            params.organizationId
-          )
-        }
+        const reversed = await this.reversePaymentsInTx(tx, payments, params.actorId, null, params.organizationId)
+        const { perPayment, allAllocations, allLedgerEntries, invoicesReopened } = reversed
 
         const amountReversed: Money = sumMoney(perPayment.map(p => p.payment.amount))
 
@@ -944,17 +1217,7 @@ export class BillingService {
               currency:   invoice.currency,
               // Full snapshot of what was removed, so the reversal is
               // replayable from the log alone.
-              payments: perPayment.map(({ payment, allocations }) => ({
-                transactionId: payment.id,
-                amount:        payment.amount,
-                allocations:   allocations.map(a => ({
-                  id:        a.id,
-                  invoiceId: a.invoiceId,
-                  amount:    a.amount,
-                  createdBy: a.createdBy,
-                  createdAt: a.createdAt.toISOString(),
-                })),
-              })),
+              payments: this.reversalSnapshot(perPayment),
               invoicesReopened,
               ledgerEntryIds: allLedgerEntries.map(e => e.id),
             },

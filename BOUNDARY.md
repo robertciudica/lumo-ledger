@@ -14,7 +14,9 @@ store. Nothing else is exported.
 | `BillingService#previewAllocation` | `(params: PreviewAllocationParams) => Promise<PreviewAllocationResult>` | Dry run of the waterfall. Writes nothing. Refuses a currency the open charges do not share, the same as `recordPayment`. |
 | `BillingService#applyCredit` | `(params: ApplyCreditParams) => Promise<ApplyCreditResult>` | Spend an account's standing credit against its open charges. |
 | `BillingService#calculateStandingCredit` | `(accountId: string, organizationId: string) => Promise<Money>` | Payments minus allocations minus credit notes: money on the account that no charge has claimed. Not what the account owes. `calculateBalance` is a deprecated alias. |
-| `BillingService#voidInvoicePayments` | `(params: VoidInvoicePaymentsParams) => Promise<VoidInvoicePaymentsResult>` | Reverse every live payment on one charge. The unit is the charge, not the payment. |
+| `BillingService#reversePayment` | `(params: ReversePaymentParams) => Promise<ReversePaymentResult>` | The money never arrived. Voids one payment in place, removes every allocation it funded, reopens every charge it covered, voids its cash row. Whole or not at all. |
+| `BillingService#voidInvoicePayments` | `(params: VoidInvoicePaymentsParams) => Promise<VoidInvoicePaymentsResult>` | `reversePayment` for every live payment on one charge, entered from the charge's side. |
+| `BillingService#voidInvoice` | `(params: VoidInvoiceParams) => Promise<VoidInvoiceResult>` | The charge should not exist. Marks it VOID and releases its allocations to standing credit. Payments untouched. |
 | `BillingService#applyCreditNote` | `(params: ApplyCreditNoteParams) => Promise<CreditNote>` | Reduce what an account owes without money moving. |
 | `BillingService#createManualInvoice` | `(params: CreateManualInvoiceParams) => Promise<Invoice>` | Create a charge with an explicit amount. No pricing logic. Needs `MANAGE_FINANCES`. |
 | `LedgerService` | `new LedgerService(store: LedgerStore, taxonomy: CategoryTaxonomy, options?: LedgerServiceOptions)` | The cash ledger: what came in, what went out. |

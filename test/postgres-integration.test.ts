@@ -190,6 +190,26 @@ describe('the ledger on Postgres', () => {
     expect(await store.findLedgerEntriesByTransaction(paid.transactionId, ORG)).toEqual([])
   })
 
+  it('voids a paid charge, keeps the payment, and lets the credit be spent', async () => {
+    const january = await charge('2026-01', 5000, '2026-01-31T00:00:00Z')
+    const paid = await billing.recordPayment({
+      ...actor, idempotencyKey: 'pay_1', accountId: 'acc_1', payerId: 'payer_1',
+      amount: 5000, currency: 'EUR', paymentMethod: 'CARD',
+    })
+
+    const voided = await billing.voidInvoice({ ...actor, idempotencyKey: 'void_1', invoiceId: january.id, reason: 'Duplicate' })
+
+    expect(voided.amountReleased).toBe(5000)
+    expect((await store.findInvoiceById(january.id, ORG))?.status).toBe('VOID')
+    expect((await store.findTransactionById(paid.transactionId, ORG))?.voidedAt).toBeNull()
+    expect(await billing.calculateStandingCredit('acc_1', ORG)).toBe(5000)
+
+    const february = await charge('2026-02', 5000, '2026-02-28T00:00:00Z')
+    const applied = await billing.applyCredit({ ...actor, idempotencyKey: 'credit_1', accountId: 'acc_1' })
+    expect(applied.applied).toBe(5000)
+    expect((await store.findInvoiceById(february.id, ORG))?.status).toBe('PAID')
+  })
+
   it('refuses a replayed idempotency key', async () => {
     await charge('2026-01', 5000, '2026-01-31T00:00:00Z')
     const payment = {

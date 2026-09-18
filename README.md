@@ -74,8 +74,11 @@ import { PostgresLedgerStore } from 'lumo-ledger/postgres'
 7. **A tenant cannot reach another tenant's rows.** Every storage call takes a
    tenant id; rows without a tenant column are reached through a parent.
 8. **Allocation is oldest first**, for payments and for standing credit.
-9. **Reversal is all or nothing per payment.** A payment that covered three
-   charges reopens all three. Un-receiving part of one would break rule 1.
+9. **Reversal is all or nothing per payment, and a wrong charge is a different
+   event.** Reversing a payment declares the money never arrived: every charge
+   it covered reopens, because un-receiving part of one would break rule 1.
+   Voiding a charge declares the charge should not exist: the payments that
+   covered it stay, and their money becomes standing credit.
 10. **Allocation is serialised per account.** Every operation that spends an
     outstanding balance takes a row lock on the account first, so two of them
     cannot read the same balance and both spend it.
@@ -274,11 +277,19 @@ exclude it, and one that forgot would show a charge as paid by money that never
 arrived. I counted the call sites before deciding: about twenty. The event row
 keeps a full snapshot, which is what makes the delete acceptable.
 
-**The unit of reversal is the charge, not the payment.** A charge settled by two
-partial payments is cleared in one call. People think "this charge is wrong", not
-"the second of these two payments is wrong". Picking one payment out of several
-was rejected because it invites the half-reversal that breaks rule 1. In
-production this turns fixing a mistyped amount into one action.
+**"The payment never arrived" and "the charge was wrong" are two operations.**
+`reversePayment` is the first: the payment is voided in place, every allocation
+it funded is removed, every charge it covered is re-projected from what remains,
+and its cash row leaves the totals. A payment is reversed whole or not at all,
+because un-receiving part of one would leave the other charges propped up by
+money declared never to have arrived. `voidInvoicePayments` is the same
+operation for every payment on one charge, for the operator who found the
+problem from the charge's side. `voidInvoice` is the second: the charge becomes
+VOID, its allocations are released, and the payments are untouched, so their
+money becomes standing credit. Until 1.1 the ledger had only the first, entered
+through a charge, which meant clearing a wrong charge declared a real payment
+nonexistent and reopened everything else it had covered. `Invoice` here means a
+charge somebody owes; it carries no document, numbering or tax.
 
 **The stored status is a projection, and the allocations are the truth.** Writing
 a status and then ignoring it on read sounds redundant until the column drifts:

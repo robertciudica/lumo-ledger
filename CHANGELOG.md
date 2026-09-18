@@ -12,6 +12,14 @@ storage port, which was documented rather than enforced.
 
 ### Added
 
+- **`reversePayment` and `voidInvoice`.** "The payment never arrived" and "the
+  charge should not exist" are different accounting events, and 1.0 had only
+  the first, entered through a charge. `reversePayment` is now the primitive
+  and `voidInvoicePayments` is it applied to every payment on one charge.
+  `voidInvoice` marks a charge VOID and releases its allocations to standing
+  credit, leaving the payments alone. Nothing in 1.0 could set VOID at all.
+  New event type `INVOICE_VOIDED`.
+
 - **`LedgerStore.lockAccount`.** A row lock held until the enclosing
   transaction commits. Every operation that changes what is allocated on an
   account takes it first. Without it two concurrent payments read the same

@@ -22,6 +22,7 @@ export const SYSTEM_ACTOR_ID = 'system' as const
 /** Canonical event type values written by the ledger. */
 export const EVENT_TYPES = {
   INVOICE_CREATED:                'INVOICE_CREATED',
+  INVOICE_VOIDED:                 'INVOICE_VOIDED',
   TRANSACTION_RECORDED:           'TRANSACTION_RECORDED',
   TRANSACTION_VOIDED:             'TRANSACTION_VOIDED',
   ALLOCATION_APPLIED:             'ALLOCATION_APPLIED',

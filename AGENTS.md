@@ -31,7 +31,9 @@ new BillingService(store: LedgerStore, config: { paymentCategory: string, clock?
   previewAllocation(params): Promise<{ steps, totalAllocated, credit }>
   applyCredit(params): Promise<{ applied, remainingCredit, invoicesTouched }>
   calculateStandingCredit(accountId: string, organizationId: string): Promise<number>
-  voidInvoicePayments(params): Promise<VoidInvoicePaymentsResult>
+  reversePayment(params): Promise<ReversePaymentResult>          // money never arrived
+  voidInvoicePayments(params): Promise<VoidInvoicePaymentsResult> // reversePayment for every payment on a charge
+  voidInvoice(params): Promise<VoidInvoiceResult>                 // charge should not exist; allocations released
   applyCreditNote(params): Promise<CreditNote>
   createManualInvoice(params): Promise<Invoice>
 
@@ -97,7 +99,9 @@ constraint that was.
    the transaction, and writes the event row inside it. Keep that order.
 6. Every storage call passes `organizationId`. Never add a method that omits it,
    and never take a tenant id from anything the end user controls.
-7. VOID is terminal in both directions.
+7. VOID is terminal in both directions, and only `voidInvoice` sets it. Do not
+   conflate it with reversal: a voided charge keeps its payments, a reversed
+   payment reopens its charges.
 8. `previewAllocation` and `recordPayment` both call `planWaterfall`. Do not
    reimplement the algorithm in either; `test/preview-allocation.test.ts` still
    asserts they agree.
