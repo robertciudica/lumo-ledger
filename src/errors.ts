@@ -13,8 +13,10 @@
  * - Idempotency has two layers. The pre-flight read of the event log is the
  *   fast path; the store's unique constraint on (organizationId,
  *   idempotencyKey) is the guarantee. Both surface to the caller as
- *   `IdempotencyError`: the services translate a `UniqueViolationError` on
- *   the event-log write, so a lost race looks the same as a repeated call.
+ *   `IdempotencyError`: a store reports the constraint as
+ *   `DuplicateIdempotencyKeyError` and the services translate it, so a lost
+ *   race looks the same as a repeated call. Which physical constraint that
+ *   is stays inside the store.
  */
 
 /**
@@ -105,7 +107,20 @@ export class UniqueViolationError extends StoreError {
 }
 
 /**
- * The constraint name every store MUST report on a duplicate
- * (organizationId, idempotencyKey), whatever the physical index is called.
+ * The store rejected an event row because its (organizationId, idempotencyKey)
+ * was already present. Every `LedgerStore` MUST throw this, and not a generic
+ * `UniqueViolationError`, from `createEventLog` on that condition: the store
+ * knows which of its constraints means "duplicate key", and the ledger does
+ * not want to. The services turn this into `IdempotencyError`.
  */
-export const EVENT_LOG_KEY_CONSTRAINT = 'event_log_org_key_uq'
+export class DuplicateIdempotencyKeyError extends UniqueViolationError {
+  constructor(organizationId: string, idempotencyKey: string, cause?: unknown) {
+    super(
+      `Duplicate idempotency key ${idempotencyKey} in tenant ${organizationId}`,
+      undefined,
+      cause
+    )
+    this.name = 'DuplicateIdempotencyKeyError'
+    ;(this as { code: string }).code = 'DUPLICATE_IDEMPOTENCY_KEY'
+  }
+}

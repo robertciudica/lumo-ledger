@@ -17,7 +17,7 @@ import {
   IdempotencyError,
   NotFoundError,
   UniqueViolationError,
-  EVENT_LOG_KEY_CONSTRAINT,
+  DuplicateIdempotencyKeyError,
 } from '../src'
 import type { LedgerStore } from '../src'
 import {
@@ -166,7 +166,7 @@ describe('invariant: one event row per mutating operation, keyed for idempotency
       idempotencyKey: 'racing_key',
     }
     await db.createEventLog(row, ORG)
-    await expect(db.createEventLog(row, ORG)).rejects.toThrow(/unique constraint/)
+    await expect(db.createEventLog(row, ORG)).rejects.toBeInstanceOf(DuplicateIdempotencyKeyError)
   })
 })
 
@@ -537,9 +537,16 @@ describe('invariant: a lost idempotency race looks like a repeated call', () => 
     await expect(failure).rejects.not.toBeInstanceOf(IdempotencyError)
   })
 
-  it('names the event-log constraint the same way in every store', () => {
-    // A store that reports a different constraint name for this violation
-    // silently turns a race into a 500. The name is part of the port.
-    expect(EVENT_LOG_KEY_CONSTRAINT).toBe('event_log_org_key_uq')
+  it('recognises the duplicate by its type, not by a constraint name', async () => {
+    // The ledger never learns what the store's index is called. A store that
+    // throws a generic unique violation here has not honoured the port, and
+    // the contract suite catches that.
+    const db = blindStore()
+    const billing = new BillingService(db, { paymentCategory: PAYMENT_CATEGORY })
+    db.seed.accounts.push(accountFactory({ id: 'acc_1', organizationId: ORG }))
+    db.createEventLog = async () => {
+      throw new DuplicateIdempotencyKeyError(ORG, 'pay_1')
+    }
+    await expect(pay(billing, 'pay_1', 1000)).rejects.toBeInstanceOf(IdempotencyError)
   })
 })

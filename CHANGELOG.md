@@ -37,6 +37,25 @@ storage port, which was documented rather than enforced.
 
 ### Fixed
 
+- **`computeEffectiveStatus` fell back to the stored status.** Its last line
+  returned the column, so a stale PAID on a charge with nothing landed on it
+  still read as PAID: the drift the function exists to end, preserved in one
+  line. It now derives every state but VOID, and the waterfall and the
+  targeted payment decide "still owed" from allocations rather than from the
+  column.
+- **Money was checked for integrality, not safety.** Guards used
+  `Number.isInteger`, which accepts values beyond 2^53 where JavaScript
+  integers stop being exact. Every entry point now requires a safe integer and
+  every sum goes through `sumMoney`, which throws rather than round.
+- **The ledger recognised a duplicate idempotency key by a Postgres constraint
+  name.** The services compared `error.constraint` against
+  `event_log_org_key_uq`, which leaked the relational schema into the domain.
+  A store now reports `DuplicateIdempotencyKeyError`, and which constraint
+  that came from is the store's business.
+- **The concurrency tests forced their interleaving with a timed pause.** They
+  use a counting latch, so the race is a certainty and a deadlock fails the
+  test instead of hanging it.
+
 - **A payment could settle a charge in another currency at face value.**
   Every path that allocates now refuses to cross a currency: `recordPayment`,
   `recordPaymentForInvoice`, `previewAllocation` (which gained a `currency`

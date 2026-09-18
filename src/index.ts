@@ -12,7 +12,7 @@
 
 // ── Money ────────────────────────────────────────────────────────────────────
 export type { Money } from './money'
-export { money, isMoney } from './money'
+export { money, isMoney, sumMoney, MAX_MONEY } from './money'
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 export {
@@ -24,7 +24,7 @@ export {
   IdempotencyError,
   StoreError,
   UniqueViolationError,
-  EVENT_LOG_KEY_CONSTRAINT,
+  DuplicateIdempotencyKeyError,
 } from './errors'
 
 // ── Events ───────────────────────────────────────────────────────────────────

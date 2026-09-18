@@ -74,21 +74,25 @@ runLedgerStoreContractTests(name, makeStore, { supportsRollback, seedAccount? })
 ```
 
 Errors: `DomainError` and `NotFoundError`, `ForbiddenError`, `ValidationError`,
-`ConflictError`, `IdempotencyError`, `StoreError`, `UniqueViolationError`.
-`EVENT_LOG_KEY_CONSTRAINT` is the constraint name a store must report for a
-duplicate idempotency key.
+`ConflictError`, `IdempotencyError`, `StoreError`, `UniqueViolationError`,
+`DuplicateIdempotencyKeyError`. A store throws the last one from
+`createEventLog` on a duplicate key; the ledger never learns which physical
+constraint that was.
 
 ## Rules you must not break
 
-1. Amounts are integers in minor units. Never introduce floating-point
-   arithmetic on money, never divide without deciding where the remainder goes.
+1. Amounts are safe integers in minor units. Never introduce floating-point
+   arithmetic on money, never divide without deciding where the remainder goes,
+   and sum with `sumMoney`, which refuses to leave the safe range.
 2. Never mutate a recorded amount. Corrections are void plus re-add, or reverse
    plus re-record.
 3. `allocated + credit` must equal the amount received. The runtime check in
    `recordPayment` throws a plain `Error`, not a `DomainError`, on purpose: it is
    a bug, not user input. Do not convert it.
 4. Balances and effective status are derived on read. Do not add a stored balance
-   column, and do not start trusting `Invoice.status`.
+   column, and do not trust `Invoice.status` for anything but VOID: the
+   waterfall, the targeted payment and `computeEffectiveStatus` all decide
+   "still owed" from the allocations.
 5. Every mutating method takes an `idempotencyKey`, checks the event log before
    the transaction, and writes the event row inside it. Keep that order.
 6. Every storage call passes `organizationId`. Never add a method that omits it,
@@ -100,9 +104,10 @@ duplicate idempotency key.
 9. Every operation that allocates calls `tx.lockAccount` as its first statement
    inside the transaction. Reads whose result the operation then spends belong
    inside the lock, not before it.
-10. A store reports failures as `StoreError` or `UniqueViolationError`. The
-    services turn a `UniqueViolationError` on `EVENT_LOG_KEY_CONSTRAINT` into
-    `IdempotencyError`; keep that translation in `anchored()`.
+10. A store reports failures as `StoreError` or `UniqueViolationError`, and a
+    duplicate idempotency key as `DuplicateIdempotencyKeyError`. The services
+    turn that one into `IdempotencyError`; keep the translation in `anchored()`
+    and keep constraint names out of `src/receivables` and `src/cash`.
 11. The services take their clock from config. Do not call `new Date()` in
     `src/`, and do not use fake timers in tests.
 12. A payment, a targeted payment, a preview and a credit application all

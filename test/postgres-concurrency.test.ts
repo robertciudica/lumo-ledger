@@ -161,20 +161,21 @@ describeWithPostgres('the account lock, on a real Postgres', () => {
     // Two payments have to interleave for the bug to appear: both must read
     // the charge before either writes. On a laptop they usually do not, which
     // is exactly why this class of bug reaches production and then only
-    // happens on the busy day. The pause below makes the interleaving
-    // deterministic rather than hoping for it.
+    // happens on the busy day. The latch below makes the interleaving a
+    // certainty rather than a probability: neither transaction may write
+    // until both have read.
     const invoiceId = await openCharge(10000)
+    const bothHaveRead = new Latch(2)
 
-    // Same store, same pause, lock replaced by a plain read: what an
-    // implementation that treats lockAccount as "just another
-    // findAccountById" would do.
+    // Same store, lock replaced by a plain read: what an implementation that
+    // treats lockAccount as "just another findAccountById" would do.
     class UnlockedStore extends PostgresLedgerStore {
       async lockAccount(accountId: string, organizationId: string): Promise<Account | null> {
         return this.findAccountById(accountId, organizationId)
       }
       async findAllocationsByAccount(accountId: string, organizationId: string) {
         const rows = await super.findAllocationsByAccount(accountId, organizationId)
-        await pause(150) // both transactions now hold the same reading
+        await bothHaveRead.arriveAndWait() // hold here until the other has read too
         return rows
       }
     }
@@ -192,22 +193,31 @@ describeWithPostgres('the account lock, on a real Postgres', () => {
   })
 
   it('holds the same race correctly when the lock is there', async () => {
-    // The identical pause, with lockAccount doing its job: the second
-    // transaction waits at the lock instead of reading stale balances, so it
-    // sees the charge already covered and its money becomes credit.
+    // The identical interleaving attempt, with lockAccount doing its job. A
+    // does not write until B has asked for the lock, so B is provably waiting
+    // behind A's transaction rather than merely arriving later. When B is let
+    // through it reads the charge already covered and its money becomes
+    // credit.
     const invoiceId = await openCharge(10000)
+    const bHasAskedForLock = new Latch(1)
 
-    class SlowStore extends PostgresLedgerStore {
+    class FirstStore extends PostgresLedgerStore {
       async findAllocationsByAccount(accountId: string, organizationId: string) {
         const rows = await super.findAllocationsByAccount(accountId, organizationId)
-        await pause(150)
+        await bHasAskedForLock.wait() // hold A's write until B is queued on the lock
         return rows
+      }
+    }
+    class SecondStore extends PostgresLedgerStore {
+      async lockAccount(accountId: string, organizationId: string): Promise<Account | null> {
+        bHasAskedForLock.arrive() // signal before the statement that will block
+        return super.lockAccount(accountId, organizationId)
       }
     }
 
     const results = await Promise.all([
-      pay(billingFor(new SlowStore(pgPoolClient(pool))), 'pay_a', 10000),
-      pay(billingFor(new SlowStore(pgPoolClient(pool))), 'pay_b', 10000),
+      pay(billingFor(new FirstStore(pgPoolClient(pool))), 'pay_a', 10000),
+      pay(billingFor(new SecondStore(pgPoolClient(pool))), 'pay_b', 10000),
     ])
 
     const landed = sumAllocations(await newStore().findAllocationsByInvoice(invoiceId, ORG))
@@ -216,7 +226,37 @@ describeWithPostgres('the account lock, on a real Postgres', () => {
   })
 })
 
-/** Lets another connection get ahead, so a race is a race and not a hope. */
-function pause(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
+/**
+ * A counting latch: `arrive()` counts one party in, `wait()` resolves once
+ * `parties` have arrived, and `arriveAndWait()` does both. Rejects rather than
+ * hangs if the count is never reached, so a deadlock fails the test instead
+ * of timing out the runner.
+ */
+class Latch {
+  private arrived = 0
+  private readonly waiters: Array<() => void> = []
+  constructor(private readonly parties: number, private readonly timeoutMs = 5000) {}
+
+  arrive(): void {
+    this.arrived += 1
+    if (this.arrived >= this.parties) {
+      for (const release of this.waiters.splice(0)) release()
+    }
+  }
+
+  wait(): Promise<void> {
+    if (this.arrived >= this.parties) return Promise.resolve()
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`Latch: ${this.arrived} of ${this.parties} arrived within ${this.timeoutMs}ms`)),
+        this.timeoutMs
+      )
+      this.waiters.push(() => { clearTimeout(timer); resolve() })
+    })
+  }
+
+  arriveAndWait(): Promise<void> {
+    this.arrive()
+    return this.wait()
+  }
 }

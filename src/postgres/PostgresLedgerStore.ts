@@ -41,7 +41,7 @@ import type {
   UpdateRecurringExpenseTemplateInput,
   CreateEventLogInput,
 } from '../store'
-import { StoreError, UniqueViolationError } from '../errors'
+import { StoreError, UniqueViolationError, DuplicateIdempotencyKeyError } from '../errors'
 import type { SqlClient, SqlQueryable } from './sql-client'
 import { isSqlClient } from './sql-client'
 import type { Row } from './rows'
@@ -58,6 +58,13 @@ import {
 
 /** Postgres SQLSTATE for a unique violation. */
 const UNIQUE_VIOLATION = '23505'
+
+/**
+ * The constraint in schema.sql that means "this idempotency key was already
+ * used in this tenant". Known here and nowhere above: the store translates it
+ * into `DuplicateIdempotencyKeyError`, and the ledger never sees the name.
+ */
+export const EVENT_LOG_KEY_CONSTRAINT = 'event_log_org_key_uq'
 
 /**
  * Translates a driver error into the ledger's own error types, so a caller
@@ -631,8 +638,10 @@ export class PostgresLedgerStore implements LedgerStore {
     data: CreateEventLogInput,
     organizationId: string
   ): Promise<EventLog> {
-    const row = await this.exactlyOne(
-      'createEventLog',
+    let row: Row
+    try {
+      row = await this.exactlyOne(
+        'createEventLog',
       `INSERT INTO event_log
          (organization_id, type, payload, actor_id, actor_type, job_id, idempotency_key)
        VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7)
@@ -648,7 +657,13 @@ export class PostgresLedgerStore implements LedgerStore {
         data.jobId ?? null,
         data.idempotencyKey,
       ]
-    )
+      )
+    } catch (error) {
+      if (error instanceof UniqueViolationError && error.constraint === EVENT_LOG_KEY_CONSTRAINT) {
+        throw new DuplicateIdempotencyKeyError(organizationId, data.idempotencyKey, error.cause)
+      }
+      throw error
+    }
     return toEventLog(row)
   }
 

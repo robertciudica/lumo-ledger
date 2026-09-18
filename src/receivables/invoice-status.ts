@@ -11,6 +11,7 @@
  */
 
 import type { InvoiceStatus } from '../store'
+import { sumMoney } from '../money'
 
 /** Anything with an `amount` in minor units. Allocation rows, in practice. */
 export interface HasAmount {
@@ -24,7 +25,7 @@ export interface HasAmount {
  * projection that can lag behind them.
  */
 export function sumAllocations(allocations: readonly HasAmount[]): number {
-  return allocations.reduce((sum, a) => sum + a.amount, 0)
+  return sumMoney(allocations.map(a => a.amount))
 }
 
 /**
@@ -36,22 +37,22 @@ export function computeBalance(amount: number, paidAmount: number): number {
 }
 
 /**
- * The status to show a human, derived from allocations rather than trusted
- * from the stored column.
+ * The status to show a human, derived from the money facts. The stored
+ * column is consulted for exactly one thing: VOID.
  *
  * Order matters:
- *   1. VOID is terminal. Money landing on a voided charge never resurrects it;
- *      that would silently un-cancel something somebody deliberately cancelled.
+ *   1. VOID is terminal. It is the one state a person sets and the facts
+ *      cannot undo: money landing on a voided charge never resurrects it.
  *   2. Fully covered, overpayment included, is PAID.
  *   3. Partially covered is PARTIALLY_PAID.
- *   4. Otherwise the stored status stands.
+ *   4. Nothing landed and the due date has passed is OVERDUE.
+ *   5. Otherwise PENDING.
  *
- * OVERDUE is derived, not stored. Nothing in Lumo has ever written
- * `status: 'OVERDUE'`, so it was only reachable if a row already said so, which
- * no code path produced. That left an account three weeks past due looking
- * identical to one due at month end, and silently killed four features that
- * tested for it. It is a pure function of data already loaded, so it is
- * computed here and every consumer gets it at once.
+ * Nothing else about the stored status is trusted. Until 1.1 the last step
+ * returned the stored value, which meant a stale PAID on a charge with no
+ * allocations still read as PAID: the drift this function exists to end,
+ * preserved in its final line. A row that says PAID and has nothing landed
+ * on it now reads as what it is.
  *
  * `now` is a parameter rather than a `new Date()` call so this stays pure and
  * testable. The ledger takes no clock.
@@ -72,5 +73,5 @@ export function computeEffectiveStatus(
   if (balance <= 0) return 'PAID'
   if (paidAmount > 0) return 'PARTIALLY_PAID'
   if (dueDate.getTime() < now.getTime()) return 'OVERDUE'
-  return dbStatus
+  return 'PENDING'
 }

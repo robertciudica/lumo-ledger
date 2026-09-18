@@ -12,6 +12,7 @@
 
 import type { Invoice, InvoiceStatus } from '../store'
 import type { Money } from '../money'
+import { sumMoney } from '../money'
 
 /** One charge the waterfall may land on, with what has already been paid. */
 export interface OpenCharge {
@@ -43,19 +44,19 @@ export interface WaterfallPlan {
 /**
  * The charges a payment may land on, oldest first.
  *
- * PENDING, PARTIALLY_PAID and OVERDUE are all still owed. OVERDUE is included
- * because excluding it would record the payment as credit while leaving the
- * overdue charge outstanding, which is a reconciliation bug that only shows up
- * at month end. Sorted ascending by createdAt: the most overdue debt first, the
- * standard accounting waterfall.
+ * Every charge that is not VOID is a candidate. Whether it is still owed is
+ * decided by the planner from its allocations, not by the stored status:
+ * a charge whose column says PAID but which has nothing landed on it is
+ * owed, and a charge whose column lags behind its allocations is not. VOID
+ * is the one stored state that is honoured, because it is the one state the
+ * facts cannot derive: a person cancelled the charge.
+ *
+ * Sorted ascending by createdAt: the most overdue debt first, the standard
+ * accounting waterfall. Does not mutate its input.
  */
 export function selectOpenInvoices(invoices: readonly Invoice[]): Invoice[] {
   return invoices
-    .filter(inv =>
-      inv.status === 'PENDING' ||
-      inv.status === 'PARTIALLY_PAID' ||
-      inv.status === 'OVERDUE'
-    )
+    .filter(inv => inv.status !== 'VOID')
     .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
 }
 
@@ -111,7 +112,7 @@ export function sumAllocationsByInvoice(
 ): Map<string, Money> {
   const byInvoice = new Map<string, Money>()
   for (const a of allocations) {
-    byInvoice.set(a.invoiceId, (byInvoice.get(a.invoiceId) ?? 0) + a.amount)
+    byInvoice.set(a.invoiceId, sumMoney([byInvoice.get(a.invoiceId) ?? 0, a.amount]))
   }
   return byInvoice
 }

@@ -34,7 +34,7 @@
 
 import assert from 'node:assert/strict'
 import type { LedgerStore, Invoice, FinancialTransaction } from '../store'
-import { UniqueViolationError } from '../errors'
+import { UniqueViolationError, DuplicateIdempotencyKeyError } from '../errors'
 
 // The host runner supplies these. Declared rather than imported so this file
 // compiles and ships without a dependency on any particular test framework.
@@ -333,13 +333,11 @@ export function runLedgerStoreContractTests(
         }
         await db.createEventLog(row, ORG)
 
-        await assert.rejects(() => db.createEventLog(row, ORG), (error: unknown) => {
-          assert.ok(error instanceof UniqueViolationError)
-          // The name is part of the port: the services key off it to turn a
-          // lost race into IdempotencyError.
-          assert.equal(error.constraint, 'event_log_org_key_uq')
-          return true
-        })
+        // Not a generic unique violation: the store knows which of its
+        // constraints means "duplicate key" and says so. The services key off
+        // this type to turn a lost race into IdempotencyError; which physical
+        // constraint it was is the store's business.
+        await assert.rejects(() => db.createEventLog(row, ORG), DuplicateIdempotencyKeyError)
       })
 
       it('round-trips the payload', async () => {

@@ -117,10 +117,15 @@ CREATE INDEX IF NOT EXISTS financial_transactions_org_account_live_idx
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Allocations: which payment covers which charge.
 -- ─────────────────────────────────────────────────────────────────────────────
--- Deliberately has no organization_id. An allocation is a join between two
--- rows that each carry a tenant, and it is reached through them. A store that
--- filtered allocations by id alone would leak across tenants, and nothing in
--- the ledger could catch it, so there is no column here to be tempted by.
+-- Deliberately has no organization_id. An allocation joins a payment and a
+-- charge that each carry the tenant, and both foreign keys point at rows the
+-- tenant already owns, so the tenant of an allocation is fully determined by
+-- its parents. A column here would be a second copy of that fact, and the
+-- copies could disagree: an allocation stamped with one tenant pointing at a
+-- charge in another. Owning the tenant in exactly one place means the
+-- question "whose allocation is this" has one answer, and every read reaches
+-- allocations through the parent that holds it. The cost is that a store
+-- must join to scope them, and the contract suite checks that it does.
 --
 -- These rows are deleted on reversal rather than flagged. The event log keeps
 -- the snapshot. See the README for why.
@@ -244,9 +249,10 @@ CREATE TABLE IF NOT EXISTS event_log (
   -- This cannot. Without it, every idempotency guarantee the package makes is
   -- decoration, and a retried webhook takes the money twice.
   --
-  -- The name matters: the store reports it back as
-  -- UniqueViolationError.constraint, and the services turn that into
-  -- IdempotencyError. Rename it and a lost race becomes a 500.
+  -- PostgresLedgerStore recognises this constraint by name and reports it as
+  -- DuplicateIdempotencyKeyError; the ledger above it never sees the name.
+  -- Rename it here without renaming it in the store and a lost race becomes
+  -- an unhandled error.
   CONSTRAINT event_log_org_key_uq UNIQUE (organization_id, idempotency_key)
 );
 

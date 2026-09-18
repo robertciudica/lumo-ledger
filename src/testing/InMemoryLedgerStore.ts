@@ -38,7 +38,7 @@ import type {
   UpdateRecurringExpenseTemplateInput,
   CreateEventLogInput,
 } from '../store'
-import { StoreError, UniqueViolationError, EVENT_LOG_KEY_CONSTRAINT } from '../errors'
+import { StoreError, UniqueViolationError, DuplicateIdempotencyKeyError } from '../errors'
 
 export class InMemoryLedgerStore implements LedgerStore {
   /** Per-instance id counter, so two stores in one process never share ids. */
@@ -550,10 +550,7 @@ export class InMemoryLedgerStore implements LedgerStore {
       e => e.idempotencyKey === data.idempotencyKey && e.organizationId === organizationId
     )
     if (duplicate) {
-      throw new UniqueViolationError(
-        `unique constraint ${EVENT_LOG_KEY_CONSTRAINT} failed on (organizationId, idempotencyKey): ${organizationId}, ${data.idempotencyKey}`,
-        EVENT_LOG_KEY_CONSTRAINT
-      )
+      throw new DuplicateIdempotencyKeyError(organizationId, data.idempotencyKey)
     }
     const eventLog: EventLog = {
       id:             this.genId(),

@@ -26,13 +26,13 @@ import {
   ValidationError,
   IdempotencyError,
   ForbiddenError,
-  UniqueViolationError,
-  EVENT_LOG_KEY_CONSTRAINT,
+  DuplicateIdempotencyKeyError,
 } from '../errors'
 import { EVENT_TYPES, SYSTEM_ACTOR_ID } from '../events'
 import type { Permission } from '../permissions'
 import { requirePermission } from '../permissions'
 import type { Money } from '../money'
+import { sumMoney } from '../money'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Category guard: a category must be used in the direction its owner declared.
@@ -150,13 +150,9 @@ export interface LedgerTotals {
  * excluded: they never count toward in, out or net.
  */
 export function computeLedgerTotals(entries: readonly LedgerEntry[]): LedgerTotals {
-  let inn: Money = 0
-  let out: Money = 0
-  for (const e of entries) {
-    if (e.voidedAt) continue
-    if (e.direction === 'IN') inn += e.amount
-    else out += e.amount
-  }
+  const live = entries.filter(e => !e.voidedAt)
+  const inn = sumMoney(live.filter(e => e.direction === 'IN').map(e => e.amount))
+  const out = sumMoney(live.filter(e => e.direction === 'OUT').map(e => e.amount))
   return { inn, out, net: inn - out }
 }
 
@@ -195,10 +191,7 @@ export class LedgerService {
     try {
       return await run()
     } catch (error) {
-      if (
-        error instanceof UniqueViolationError &&
-        error.constraint === EVENT_LOG_KEY_CONSTRAINT
-      ) {
+      if (error instanceof DuplicateIdempotencyKeyError) {
         throw new IdempotencyError(idempotencyKey)
       }
       throw error
@@ -209,9 +202,9 @@ export class LedgerService {
     if (amount <= 0) {
       throw new ValidationError('Amount must be positive', 'amount')
     }
-    if (!Number.isInteger(amount)) {
+    if (!Number.isSafeInteger(amount)) {
       throw new ValidationError(
-        'Amount must be an integer (minor currency units, no decimals)',
+        'Amount must be a safe integer (minor currency units, no decimals, at most 2^53 - 1)',
         'amount'
       )
     }
@@ -526,10 +519,7 @@ export class LedgerService {
       // Two runs of the job raced for the same (template, month). The
       // constraint decided; the loser reports "nothing created" rather than
       // failing a batch that has already done the right thing.
-      if (
-        error instanceof UniqueViolationError &&
-        error.constraint === EVENT_LOG_KEY_CONSTRAINT
-      ) {
+      if (error instanceof DuplicateIdempotencyKeyError) {
         return false
       }
       throw error

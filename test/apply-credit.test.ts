@@ -232,16 +232,23 @@ describe('BillingService.applyCredit()', () => {
     ).rejects.toThrow(NotFoundError)
   })
 
-  it('throws ValidationError when the targeted charge is already PAID', async () => {
+  it('throws ValidationError when the targeted charge is already covered', async () => {
     const { db, service } = makeService()
     seedCredit(db, 'txn_credit', 1000)
     db.seed.invoices.push(
       invoiceFactory({
         id:             'invoice_paid',
+        amount:         5000,
         status:         'PAID',
         accountId:      'acc_1',
         organizationId: ORG,
       })
+    )
+    db.seed.transactions.push(
+      transactionFactory({ id: 'txn_prior', amount: 5000, accountId: 'acc_1', organizationId: ORG })
+    )
+    db.seed.allocations.push(
+      allocationFactory({ id: 'alloc_prior', amount: 5000, transactionId: 'txn_prior', invoiceId: 'invoice_paid' })
     )
 
     await expect(

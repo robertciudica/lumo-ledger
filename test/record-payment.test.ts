@@ -23,6 +23,8 @@ import {
   accountFactory,
   invoiceFactory,
   eventLogFactory,
+  transactionFactory,
+  allocationFactory,
 } from '../src/testing/factories'
 import { MANAGER, OPERATOR, READER, PAYMENT_CATEGORY } from './helpers'
 
@@ -342,7 +344,9 @@ describe('BillingService.recordPayment()', () => {
     ).rejects.toThrow(ForbiddenError)
   })
 
-  it('should NOT allocate to PAID charges', async () => {
+  it('should NOT allocate to a charge its allocations already cover', async () => {
+    // "Paid" is decided by the allocations, not by the status column. This
+    // charge is covered in fact, so the waterfall skips it.
     db.seed.accounts.push(accountFactory())
     db.seed.invoices.push(
       invoiceFactory({
@@ -358,6 +362,10 @@ describe('BillingService.recordPayment()', () => {
         createdAt: new Date('2026-02-01T00:00:00Z'),
       }),
     )
+    db.seed.transactions.push(transactionFactory({ id: 'txn_prior', amount: 5000 }))
+    db.seed.allocations.push(
+      allocationFactory({ id: 'alloc_prior', amount: 5000, transactionId: 'txn_prior', invoiceId: 'inv_paid' })
+    )
 
     const result = await service.recordPayment({
       ...baseParams,
@@ -366,10 +374,32 @@ describe('BillingService.recordPayment()', () => {
       amount:         5000,
     })
 
-    expect(db.seed.allocations).toHaveLength(1)
-    expect(db.seed.allocations[0].invoiceId).toBe('inv_open')
+    expect(db.seed.allocations.filter(a => a.transactionId !== 'txn_prior')).toHaveLength(1)
+    expect(db.seed.allocations.find(a => a.transactionId !== 'txn_prior')?.invoiceId).toBe('inv_open')
     expect(result.allocated).toBe(5000)
     expect(result.credit).toBe(0)
+  })
+
+  it('allocates to a charge whose column says PAID but which has nothing landed on it', async () => {
+    // added during extraction, not from Lumo
+    //
+    // A stale status column is exactly the drift the derived reads exist to
+    // survive. Until 1.1 the waterfall trusted the column here, so a charge
+    // marked PAID by mistake could never be paid at all.
+    db.seed.accounts.push(accountFactory())
+    db.seed.invoices.push(
+      invoiceFactory({ id: 'inv_stale', amount: 5000, status: 'PAID' })
+    )
+
+    const result = await service.recordPayment({
+      ...baseParams,
+      idempotencyKey: 'pay_stale',
+      accountId:      'acc_1',
+      amount:         5000,
+    })
+
+    expect(result.allocated).toBe(5000)
+    expect(db.seed.allocations[0].invoiceId).toBe('inv_stale')
   })
 
   it('should NOT allocate to VOID charges', async () => {

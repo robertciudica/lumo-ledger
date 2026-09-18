@@ -28,13 +28,13 @@ import {
   NotFoundError,
   ValidationError,
   IdempotencyError,
-  UniqueViolationError,
-  EVENT_LOG_KEY_CONSTRAINT,
+  DuplicateIdempotencyKeyError,
 } from '../errors'
 import { EVENT_TYPES } from '../events'
 import type { Permission } from '../permissions'
 import { requirePermission } from '../permissions'
 import type { Money } from '../money'
+import { sumMoney } from '../money'
 import { monthKey } from '../cash/LedgerService'
 import {
   planWaterfall,
@@ -290,17 +290,16 @@ export class BillingService {
    * The pre-flight read of the event log can lose to a concurrent caller. The
    * store's unique constraint on (organizationId, idempotencyKey) cannot, and
    * it fires on the event-log write inside the transaction, rolling the whole
-   * thing back. From the caller's side that is indistinguishable from having
-   * submitted the key twice, so it is reported the same way.
+   * thing back. The store reports that as `DuplicateIdempotencyKeyError`; which
+   * physical constraint it came from is the store's business. From the
+   * caller's side it is indistinguishable from having submitted the key twice,
+   * so it is reported the same way.
    */
   private async anchored<T>(idempotencyKey: string, run: () => Promise<T>): Promise<T> {
     try {
       return await run()
     } catch (error) {
-      if (
-        error instanceof UniqueViolationError &&
-        error.constraint === EVENT_LOG_KEY_CONSTRAINT
-      ) {
+      if (error instanceof DuplicateIdempotencyKeyError) {
         throw new IdempotencyError(idempotencyKey)
       }
       throw error
@@ -359,9 +358,9 @@ export class BillingService {
     }
 
     // ── Guard: amount must be an integer (minor currency units) ─────────────
-    if (!Number.isInteger(params.amount)) {
+    if (!Number.isSafeInteger(params.amount)) {
       throw new ValidationError(
-        'Payment amount must be an integer (minor currency units, no decimals)',
+        'Payment amount must be a safe integer (minor currency units, no decimals, at most 2^53 - 1)',
         'amount'
       )
     }
@@ -558,9 +557,9 @@ export class BillingService {
     }
 
     // ── Guard: amount must be an integer (minor currency units) ─────────────
-    if (!Number.isInteger(params.amount)) {
+    if (!Number.isSafeInteger(params.amount)) {
       throw new ValidationError(
-        'Payment amount must be an integer (minor currency units, no decimals)',
+        'Payment amount must be a safe integer (minor currency units, no decimals, at most 2^53 - 1)',
         'amount'
       )
     }
@@ -603,7 +602,9 @@ export class BillingService {
       if (!invoice) {
         throw new NotFoundError('Invoice', params.invoiceId)
       }
-      if (invoice.status === 'PAID' || invoice.status === 'VOID') {
+      // VOID is the one stored state that is honoured. Whether the charge is
+      // still owed is decided from its allocations below, not from the column.
+      if (invoice.status === 'VOID') {
         throw new ValidationError('Invoice is not payable', 'invoiceId')
       }
       this.assertSameCurrency(params.currency, [invoice])
@@ -612,11 +613,11 @@ export class BillingService {
         params.invoiceId,
         params.organizationId
       )
-      const priorAllocated: Money = priorAllocations.reduce(
-        (sum, a) => sum + a.amount,
-        0
-      )
+      const priorAllocated: Money = sumMoney(priorAllocations.map(a => a.amount))
       const outstanding: Money = invoice.amount - priorAllocated
+      if (outstanding <= 0) {
+        throw new ValidationError('Invoice is not payable', 'invoiceId')
+      }
 
       // The targeted flow rejects overpayment. No credit spillover.
       if (params.amount > outstanding) {
@@ -842,7 +843,7 @@ export class BillingService {
             ])
 
             // Invariant: a payment can never have allocated more than it received.
-            const totalAllocated: Money = allocations.reduce((sum, a) => sum + a.amount, 0)
+            const totalAllocated: Money = sumMoney(allocations.map(a => a.amount))
             if (totalAllocated > payment.amount) {
               throw new Error(
                 `BillingService invariant violation: allocations(${totalAllocated}) exceed payment amount(${payment.amount}) on ${payment.id}`
@@ -885,7 +886,7 @@ export class BillingService {
           }
 
           const remaining = await tx.findAllocationsByInvoice(invoiceId, params.organizationId)
-          const remainingTotal: Money = remaining.reduce((sum, a) => sum + a.amount, 0)
+          const remainingTotal: Money = sumMoney(remaining.map(a => a.amount))
 
           // Mirrors the projection in recordPayment, run backwards. PENDING,
           // never OVERDUE: nothing writes OVERDUE to the stored status, because
@@ -929,10 +930,7 @@ export class BillingService {
           )
         }
 
-        const amountReversed: Money = perPayment.reduce(
-          (sum, p) => sum + p.payment.amount,
-          0
-        )
+        const amountReversed: Money = sumMoney(perPayment.map(p => p.payment.amount))
 
         // Step 5: ONE event row for the operation. It is the idempotency anchor and
         // the audit trail that justifies deleting the allocations in step 1.
@@ -1007,9 +1005,9 @@ export class BillingService {
     }
 
     // ── Guard: amount must be an integer (minor currency units) ─────────────
-    if (!Number.isInteger(params.amount)) {
+    if (!Number.isSafeInteger(params.amount)) {
       throw new ValidationError(
-        'Amount must be an integer (minor currency units, no decimals)',
+        'Amount must be a safe integer (minor currency units, no decimals, at most 2^53 - 1)',
         'amount'
       )
     }
@@ -1111,7 +1109,7 @@ export class BillingService {
       for (const allocation of accountAllocations) {
         spentByTransaction.set(
           allocation.transactionId,
-          (spentByTransaction.get(allocation.transactionId) ?? 0) + allocation.amount
+          sumMoney([spentByTransaction.get(allocation.transactionId) ?? 0, allocation.amount])
         )
       }
 
@@ -1126,7 +1124,7 @@ export class BillingService {
         .filter((s) => s.unspent > 0)
         .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
 
-      const creditBefore: Money = sources.reduce((sum, s) => sum + s.unspent, 0)
+      const creditBefore: Money = sumMoney(sources.map(s => s.unspent))
 
       // ── Resolve target charges ────────────────────────────────────────────
       let targets: Invoice[]
@@ -1135,7 +1133,14 @@ export class BillingService {
         if (!invoice) {
           throw new NotFoundError('Invoice', params.invoiceId)
         }
-        if (selectOpenInvoices([invoice]).length === 0) {
+        if (invoice.status === 'VOID') {
+          throw new ValidationError('Invoice is not payable', 'invoiceId')
+        }
+        // Covered means covered by allocations, whatever the column says.
+        const already = sumMoney(
+          (await tx.findAllocationsByInvoice(invoice.id, params.organizationId)).map(a => a.amount)
+        )
+        if (invoice.amount - already <= 0) {
           throw new ValidationError('Invoice is not payable', 'invoiceId')
         }
         targets = [invoice]
@@ -1167,10 +1172,7 @@ export class BillingService {
           invoice.id,
           params.organizationId
         )
-        const priorAllocated: Money = priorAllocations.reduce(
-          (sum, a) => sum + a.amount,
-          0
-        )
+        const priorAllocated: Money = sumMoney(priorAllocations.map(a => a.amount))
         let outstanding: Money = invoice.amount - priorAllocated
         if (outstanding <= 0) continue
 
@@ -1289,9 +1291,9 @@ export class BillingService {
     ])
 
     // Integer addition and subtraction only, never floats.
-    const totalTransactions: Money = transactions.reduce((sum, t) => sum + t.amount, 0)
-    const totalAllocations: Money = allocations.reduce((sum, a) => sum + a.amount, 0)
-    const totalCreditNotes: Money = creditNotes.reduce((sum, cn) => sum + cn.amount, 0)
+    const totalTransactions: Money = sumMoney(transactions.map(t => t.amount))
+    const totalAllocations: Money = sumMoney(allocations.map(a => a.amount))
+    const totalCreditNotes: Money = sumMoney(creditNotes.map(cn => cn.amount))
 
     return totalTransactions - totalAllocations - totalCreditNotes
   }
@@ -1326,9 +1328,9 @@ export class BillingService {
     if (params.amount <= 0) {
       throw new ValidationError('Credit note amount must be positive', 'amount')
     }
-    if (!Number.isInteger(params.amount)) {
+    if (!Number.isSafeInteger(params.amount)) {
       throw new ValidationError(
-        'Credit note amount must be an integer (minor currency units, no decimals)',
+        'Credit note amount must be a safe integer (minor currency units, no decimals, at most 2^53 - 1)',
         'amount'
       )
     }
@@ -1422,9 +1424,9 @@ export class BillingService {
     if (params.amount <= 0) {
       throw new ValidationError('Invoice amount must be positive', 'amount')
     }
-    if (!Number.isInteger(params.amount)) {
+    if (!Number.isSafeInteger(params.amount)) {
       throw new ValidationError(
-        'Invoice amount must be an integer (minor currency units, no decimals)',
+        'Invoice amount must be a safe integer (minor currency units, no decimals, at most 2^53 - 1)',
         'amount'
       )
     }

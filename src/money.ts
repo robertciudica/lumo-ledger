@@ -42,6 +42,33 @@ import { ValidationError } from './errors'
 export type Money = number
 
 /**
+ * The largest amount the ledger will hold: Number.MAX_SAFE_INTEGER, which is
+ * 9,007,199,254,740,991 minor units. Above it, JavaScript integers stop being
+ * exact and two different amounts can compare equal. Every entry point
+ * rejects an amount beyond it, and every sum inside the ledger checks that it
+ * has not crossed it, so an overflow is an error rather than a rounding.
+ */
+export const MAX_MONEY: Money = Number.MAX_SAFE_INTEGER
+
+/**
+ * Adds amounts, refusing to return a total that is not an exact integer.
+ * The only way the ledger sums money.
+ *
+ * @throws {Error} a plain Error, not a domain error: a sum leaving the safe
+ *   range is a fault in the data or the code, never in the caller's input.
+ */
+export function sumMoney(amounts: Iterable<Money>): Money {
+  let total = 0
+  for (const amount of amounts) {
+    total += amount
+    if (!Number.isSafeInteger(total)) {
+      throw new Error(`Money overflow: a sum left the safe integer range at ${total}`)
+    }
+  }
+  return total
+}
+
+/**
  * Asserts that a number is a usable amount of minor units and returns it.
  *
  * For the edge of a system, where a number arrives from a form, a webhook or
@@ -57,9 +84,9 @@ export function money(amount: number, field = 'amount'): Money {
   if (!Number.isFinite(amount)) {
     throw new ValidationError('Amount must be a finite number', field)
   }
-  if (!Number.isInteger(amount)) {
+  if (!Number.isSafeInteger(amount)) {
     throw new ValidationError(
-      'Amount must be an integer (minor currency units, no decimals)',
+      'Amount must be a safe integer (minor currency units, no decimals, at most 2^53 - 1)',
       field
     )
   }
@@ -71,5 +98,5 @@ export function money(amount: number, field = 'amount'): Money {
 
 /** True when `value` is a usable amount of minor units. No side effects. */
 export function isMoney(value: unknown): value is Money {
-  return typeof value === 'number' && Number.isInteger(value) && value > 0
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
 }

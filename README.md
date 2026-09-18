@@ -57,14 +57,17 @@ import { PostgresLedgerStore } from 'lumo-ledger/postgres'
 
 1. **A posting balances.** `allocated + credit === amount received`, checked at
    runtime. If it fails, money has gone missing inside one function.
-2. **Money is integer minor units.** Every entry point rejects a non-integer,
-   because 0.1 + 0.2 has no business near somebody's balance.
+2. **Money is integer minor units.** Every entry point rejects anything that is
+   not a safe integer, and every sum inside the ledger refuses to leave the
+   safe range, because 0.1 + 0.2 has no business near somebody's balance and
+   neither does 2^53.
 3. **Entries are immutable.** Correcting a cash row is void plus re-add;
    correcting a payment is reverse plus re-record. Voided rows stay, flagged, and
    drop out of the totals.
 4. **Balances are derived, never stored.** What is owed on a charge is its
-   amount minus its allocations, recomputed on every read. There is no balance
-   column to drift.
+   amount minus its allocations, recomputed on every read. The stored status
+   column is consulted for one value only, VOID; everything else is computed.
+   There is no balance column to drift.
 5. **VOID is terminal.** Money landing on a voided charge never resurrects it.
 6. **Every write is idempotent through the event log.** The key is checked before
    the transaction and written inside it, so a rollback releases it.
@@ -192,9 +195,9 @@ exists for:
 - **`findTransactionsByAccount` must exclude voided payments.** A reversed
   payment that comes back here reads as standing credit and can be spent again.
 - **`createEventLog` must reject a duplicate `(organizationId,
-  idempotencyKey)`,** reporting `UniqueViolationError` with the constraint named
-  `event_log_org_key_uq`. The pre-flight read is a fast path; the constraint is
-  the guarantee.
+  idempotencyKey)`,** reporting it as `DuplicateIdempotencyKeyError`. The store
+  knows which of its constraints means that; the ledger does not. The pre-flight
+  read is a fast path; the constraint is the guarantee.
 
 Running that suite against the in-memory store that shipped in 1.0 found that
 its allocation reads ignored the tenant. The reference implementation had the
@@ -303,11 +306,13 @@ date reach for a global timer mock, and it makes "now" something the caller
 cannot control. Purity where it is cheap: `computeEffectiveStatus` takes `now` as
 a parameter for the same reason.
 
-**Storage errors have types.** A store reports `StoreError`, or
-`UniqueViolationError` with the constraint name, and never lets a driver's error
-escape into the ledger. That is what lets the services tell a lost idempotency
-race from any other failed write, and it means a caller catching `DomainError`
-catches everything this package can throw.
+**Storage errors have types.** A store reports `StoreError`,
+`UniqueViolationError`, or `DuplicateIdempotencyKeyError` for the one violation
+the ledger has to recognise, and never lets a driver's error escape. Which
+physical constraint means "duplicate key" is the store's knowledge, not the
+ledger's. That is what lets the services tell a lost idempotency race from any
+other failed write, and it means a caller catching `DomainError` catches
+everything this package can throw.
 
 **`Money` is `number`, not a branded type.** The obvious suggestion, and I tried
 it and reverted. It would force a wrap at 200-odd call sites to enforce a rule

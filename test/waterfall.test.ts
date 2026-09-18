@@ -84,7 +84,10 @@ describe('planWaterfall', () => {
 describe('selectOpenInvoices', () => {
   const at = (iso: string) => new Date(iso)
 
-  it('keeps everything still owed and drops what is not', () => {
+  it('keeps every charge except a voided one; the planner decides what is owed', () => {
+    // The stored status is not trusted here. A charge whose column says PAID
+    // is still a candidate; the planner skips it only if its allocations
+    // cover it. VOID is the one stored state that is honoured.
     const invoices = [
       invoiceFactory({ id: 'pending', status: 'PENDING' }),
       invoiceFactory({ id: 'partial', status: 'PARTIALLY_PAID' }),
@@ -96,6 +99,7 @@ describe('selectOpenInvoices', () => {
       'pending',
       'partial',
       'overdue',
+      'paid',
     ])
   })
 

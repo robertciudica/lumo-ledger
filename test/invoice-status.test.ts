@@ -84,4 +84,21 @@ describe('computeEffectiveStatus()', () => {
     expect(computeEffectiveStatus('PENDING', 10000, 0, JAN, JAN)).toBe('PENDING')
     expect(computeEffectiveStatus('PENDING', 10000, 0, JAN, FEB)).toBe('OVERDUE')
   })
+
+  it('does not trust a stored PAID that the allocations contradict', () => {
+    // added during extraction, not from Lumo
+    //
+    // The column is a cache. A row that says PAID with nothing landed on it
+    // reads as what the facts say: owed, and overdue if the date has passed.
+    // Until 1.1 the last line of this function returned the stored value.
+    expect(computeEffectiveStatus('PAID', 10000, 0, FEB, JAN)).toBe('PENDING')
+    expect(computeEffectiveStatus('PAID', 10000, 0, JAN, FEB)).toBe('OVERDUE')
+    expect(computeEffectiveStatus('PARTIALLY_PAID', 10000, 0, FEB, JAN)).toBe('PENDING')
+  })
+
+  it('honours VOID and nothing else from storage', () => {
+    // added during extraction, not from Lumo
+    expect(computeEffectiveStatus('VOID', 10000, 10000, FEB, JAN)).toBe('VOID')
+    expect(computeEffectiveStatus('OVERDUE', 10000, 10000, JAN, FEB)).toBe('PAID')
+  })
 })

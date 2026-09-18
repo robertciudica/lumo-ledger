@@ -32,7 +32,9 @@ store. Nothing else is exported.
 | `planWaterfall` | `(open: readonly OpenCharge[], amount: Money) => WaterfallPlan` | Where a payment would land. The one implementation of the algorithm; `recordPayment` commits it and `previewAllocation` displays it. |
 | `selectOpenInvoices` | `(invoices: readonly Invoice[]) => Invoice[]` | The charges still owed, oldest first. |
 | `sumAllocationsByInvoice` | `(allocations) => Map<string, Money>` | Groups allocation amounts by charge, so one query serves every charge. |
-| `money` | `(amount: number, field?: string) => Money` | Validates an amount at your own boundary. Throws `ValidationError`. |
+| `money` | `(amount: number, field?: string) => Money` | Validates an amount at your own boundary: a positive safe integer. Throws `ValidationError`. |
+| `sumMoney` | `(amounts: Iterable<Money>) => Money` | The only way the ledger adds money. Throws if the total leaves the safe integer range. |
+| `MAX_MONEY` | `Money` | `Number.MAX_SAFE_INTEGER`, the largest amount the ledger holds. |
 | `isMoney` | `(value: unknown) => boolean` | The same question without throwing. |
 | `sumAllocations` | `(allocations: readonly HasAmount[]) => number` | What has landed on a charge. |
 | `computeBalance` | `(amount: number, paidAmount: number) => number` | What is still owed. Never negative. |
@@ -61,10 +63,11 @@ store. Nothing else is exported.
 `DomainError` (base, carries `code`), and `NotFoundError`, `ForbiddenError`,
 `ValidationError`, `ConflictError`, `IdempotencyError`.
 
-Thrown by a store rather than by the ledger: `StoreError` (carries `cause`) and
-`UniqueViolationError` (carries `constraint`). `EVENT_LOG_KEY_CONSTRAINT` is
-the name a store must report for a duplicate `(organizationId,
-idempotencyKey)`; the services translate that one into `IdempotencyError`.
+Thrown by a store rather than by the ledger: `StoreError` (carries `cause`),
+`UniqueViolationError` (carries `constraint`), and `DuplicateIdempotencyKeyError`,
+which a store must throw from `createEventLog` on a duplicate
+`(organizationId, idempotencyKey)`. The services translate that one into
+`IdempotencyError`; which constraint it came from stays inside the store.
 
 ## Types and constants
 

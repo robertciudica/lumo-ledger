@@ -19,6 +19,8 @@ import {
   accountFactory,
   invoiceFactory,
   eventLogFactory,
+  transactionFactory,
+  allocationFactory,
 } from '../src/testing/factories'
 import { MANAGER, READER, PAYMENT_CATEGORY } from './helpers'
 
@@ -229,8 +231,12 @@ describe('BillingService.recordPaymentForInvoice()', () => {
     expect((caught as ValidationError).field).toBe('amount')
   })
 
-  it('should throw ValidationError when paying a PAID charge', async () => {
+  it('should throw ValidationError when paying a charge its allocations already cover', async () => {
     db.seed.invoices.push(invoiceFactory({ id: 'inv_paid_tgt', amount: 5000, status: 'PAID' }))
+    db.seed.transactions.push(transactionFactory({ id: 'txn_prior', amount: 5000 }))
+    db.seed.allocations.push(
+      allocationFactory({ id: 'alloc_prior', amount: 5000, transactionId: 'txn_prior', invoiceId: 'inv_paid_tgt' })
+    )
 
     await expect(
       service.recordPaymentForInvoice({
