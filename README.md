@@ -17,7 +17,7 @@ I pulled it out as a package because the accounting part is the part I would
 want to reuse, and the part I think is worth reading. 1.0 is the production
 code with the studio names replaced by generic ones. 1.1 adds the account lock
 described under Concurrency, which I found while reviewing the extraction and
-am porting back.
+have since ported back into Lumo, where it runs in production.
 
 No runtime dependencies. No framework, no ORM, no HTTP layer, no clock of its
 own.
